@@ -386,6 +386,24 @@ def build_subagent_graph(
                         args = {**args, "suggestions": batch.get("primaries") or batch.get("suggestions") or [],
                                 "reserves": batch.get("reserves") or []} # use recorded BO candidates
                         break
+            if name == "check_suggestion_diversity":
+                for message in reversed(state["messages"] + results):
+                    if not isinstance(message, ToolMessage) or message.name not in {"propose_experiments", "run_bo_iteration"}:
+                        continue
+                    batch = json.loads(message.content)
+                    failed = (batch.get("error") or batch.get("abort") or batch.get("no_op")
+                              or batch.get("returncode") not in (None, 0))
+                    if message.name == "propose_experiments" and failed:
+                        continue
+                    args = {"suggestions": []}
+                    if not failed:
+                        if message.name == "propose_experiments":
+                            points = batch.get("suggestions", [])
+                        else:
+                            points = batch.get("primaries") or batch.get("suggestions", [])
+                        for point in points:
+                            args["suggestions"].append(point.get("conc", point))
+                    break # the latest BO run bounds the current batch
             print(f"\n[{label}/Tool] {name}({json.dumps(args)[:200]})")
             if tool_overrides and name in tool_overrides:
                 content = str(tool_overrides[name](args))

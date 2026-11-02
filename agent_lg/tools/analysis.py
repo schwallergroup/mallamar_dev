@@ -105,6 +105,11 @@ def _tool_estimate_roughness(db_path: str, n_select: int = 24, k: int = 5):
 
 def _tool_check_suggestion_diversity(suggestions: list):
     """Check diversity of suggestions based on pairwise distances in input space."""
+    if not isinstance(suggestions, list):
+        return {"error": "Provide suggestions as a list of concentration dictionaries, not text."}
+    for point in suggestions:
+        if not isinstance(point, dict):
+            return {"error": "Each suggestion must be a concentration dictionary."}
     if not suggestions:
         return {"error": "Empty suggestions list"}
     # Collect all numeric keys, excluding pure-ID columns
