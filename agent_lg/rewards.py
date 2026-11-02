@@ -16,49 +16,31 @@ RAW_COLS = [
     "total_time_s", "n_osc",
 ]
 
-# WHY a failure row is a failure. `n_osc == 0` earns the hard penalty below
-# regardless, so the campaign never stalls on a missing result — but n_osc alone
-# cannot say whether the CHEMISTRY failed or the ROBOT did, and those are not the
-# same evidence. Without this column a pump jam is indistinguishable from a dead
-# composition, so BO hard-penalises a region because a pump jammed, and the
-# failure-region analysis in a paper silently includes rows that were never
-# measured. Blank means a genuine successful measurement.
+# Distinguish chemistry failures, hardware failures and missing results; successful rows have no failure label.
 FAILURE_MODE_COL = "failure_mode"
-FAILURE_CHEMISTRY = "chemistry" # ran, did not oscillate — real evidence
-FAILURE_HW = "hw_failed" # robot reported state=failed — NOT chemistry evidence
+FAILURE_CHEMISTRY = "chemistry" # ran, did not oscillate, real evidence
+FAILURE_HW = "hw_failed" # robot reported state=failed, NOT chemistry evidence
 FAILURE_NO_RESULT = "no_result" # reported finished but no row ever appeared — unknown
 
-# The five quantities that get z-scored. Period variability is captured via
-# coefficient of variation (std/mean), not raw std.
+# Normalize five metrics, using std/mean for period variability.
 _ZCOLS = [
     "interp_period_mean_s", "period_cv",
     "total_time_capped_s", "interp_maxima_mean_V", "interp_amplitude_mean_V",
 ]
 
-# Reward formula coefficients (single source of truth — used by rewards_from_raw
-# AND for deriving the failure penalty below):
-#   reward_oscillation = (-22.6·z(period_mean) - 2.4·z(period_cv)) / 25.0
-#   reward_signal      = (100·z(total_time_capped) + 3.8·z(maxima_mean) + 2.4·z(amplitude_mean)) / 106.2
+# Use these coefficients for both reward scoring and failure penalties.
 _COEF_OSC = (-22.6, -2.4) # period_mean, period_cv
 _COEF_SIG = (100.0, 3.8, 2.4) # total_time_capped, maxima_mean, amplitude_mean
-_NORM_OSC = sum(abs(c) for c in _COEF_OSC) # 0
-_NORM_SIG = sum(abs(c) for c in _COEF_SIG) # 2
+_NORM_OSC = sum(abs(c) for c in _COEF_OSC)
+_NORM_SIG = sum(abs(c) for c in _COEF_SIG)
 
 REWARD_COLS = ["reward_oscillation", "reward_signal"]
 
-# Concentration columns + rounding precision (grid resolution) for matching a
-# robot-measured row back to its candidate row in single-pool mode.
+# Match robot results to pool rows using concentrations rounded to the grid precision.
 CONC_COLS = ["conc_MA_M", "conc_NaBrO3_M", "conc_H2SO4_M", "conc_Ru_M"]
 CONC_ROUND = {"conc_MA_M": 4, "conc_NaBrO3_M": 4, "conc_H2SO4_M": 4, "conc_Ru_M": 7}
 
-# Failure-region penalty (Sandro's convention). When n_osc=0, treat every
-# z-scored metric as |z|=5 in the BAD direction per its sign in the formula
-# above. That yields a constant, dataset-independent penalty strictly worse
-# than any plausible observation (real |z| rarely > 3). Failed rows leave the
-# heldout pool AND are strictly dominated → BO avoids the region naturally
-# without polluting the GP with arbitrary extreme z-scores.
-#   _FAIL_PENALTY_OSC = (-22.6·5 - 2.4·5) / 25.0                = -125 / 25.0   = -5.0
-#   _FAIL_PENALTY_SIG = (100·(-5) + 3.8·(-5) + 2.4·(-5)) / 106.2 = -531 / 106.2 = -5.0
+# Assign both objectives a fixed -5 penalty when an attempted experiment has no oscillations.
 _FAIL_PENALTY_OSC = sum(-5.0 * abs(c) for c in _COEF_OSC) / _NORM_OSC
 _FAIL_PENALTY_SIG = sum(-5.0 * abs(c) for c in _COEF_SIG) / _NORM_SIG
 
@@ -75,13 +57,10 @@ def _apply_failure_penalty(df: pd.DataFrame, attempted: pd.Series):
     """Apply the configured penalty to failed experiment rows."""
     failed = attempted & (pd.to_numeric(df["n_osc"], errors="coerce").fillna(-1) == 0)
 
-    # Label the ones nobody else labelled. A row that reached here with n_osc=0 and no
-    # failure_mode was written by the instrument after a real run, so the chemistry is
-    # the evidence. Rows already marked hw_failed / no_result keep their label — they
-    # still get the penalty (so the campaign proceeds) but stay identifiable as
-    # non-chemistry afterwards.
+    # Label unlabelled failures as chemistry failures while preserving hardware and missing-result labels.
     if FAILURE_MODE_COL not in df.columns:
         df[FAILURE_MODE_COL] = pd.NA
+    df[FAILURE_MODE_COL] = df[FAILURE_MODE_COL].astype("object")
     unlabelled = failed & df[FAILURE_MODE_COL].isna()
     if unlabelled.any():
         df.loc[unlabelled, FAILURE_MODE_COL] = FAILURE_CHEMISTRY
@@ -109,8 +88,20 @@ def fit_reward_norm(df_observed: pd.DataFrame):
     missing = [c for c in RAW_COLS if c not in df_observed.columns]
     if missing:
         raise KeyError(f"reference set is missing raw metric columns: {missing}")
-    d = _derive(df_observed)
-    return {c: [float(d[c].mean()), float(d[c].std())] for c in _ZCOLS}
+    successful = pd.to_numeric(df_observed["n_osc"], errors="coerce") > 0
+    d = _derive(df_observed.loc[successful])
+    if len(d) < 2:
+        raise ValueError('[rewards] Normalization needs at least two successful measurements; recorded results are preserved')
+    values = d[_ZCOLS].apply(pd.to_numeric, errors='raise')
+    if not np.isfinite(values.to_numpy()).all():
+        raise ValueError('[rewards] Successful measurements contain missing or non-finite reward metrics')
+    norm = {}
+    for column in _ZCOLS:
+        stats = [float(values[column].mean()), float(values[column].std())]
+        if not np.isfinite(stats).all():
+            raise ValueError('[rewards] Cannot fit finite normalization statistics; inspect the successful raw metrics')
+        norm[column] = stats
+    return norm
 
 
 def rewards_from_raw(df: pd.DataFrame, norm: dict):
@@ -142,8 +133,7 @@ def recompute_all_rewards(db_path):
     df = read_csv(db_path)
     missing = [c for c in RAW_COLS if c not in df.columns]
     if missing:
-        # Incomplete schema (e.g. mock robot / precomputed dummy DB) — leave the
-        # rewards alone instead of raising. Loud enough to spot a real misconfig.
+        # Leave rewards unchanged when raw metric columns are missing.
         print(f"[rewards] skip recompute — DB missing raw metric columns {missing}")
         return 0
 
@@ -152,10 +142,8 @@ def recompute_all_rewards(db_path):
     if n == 0:
         return 0
 
-    # Fit z-norm only on rows that actually oscillated. pandas mean/std skip NaN
-    # so this is partly redundant, but explicit avoids surprises if a future
-    # raw_col is added that doesn't go NaN on failure.
-    osc_rows = attempted & df["interp_period_mean_s"].notna()
+    # Failed runs may retain finite placeholder metrics; exclude them from normalization.
+    osc_rows = attempted & (pd.to_numeric(df["n_osc"], errors="coerce") > 0)
     for col in REWARD_COLS:
         if col not in df.columns:
             df[col] = np.nan
@@ -164,10 +152,9 @@ def recompute_all_rewards(db_path):
         norm = fit_reward_norm(df.loc[osc_rows]) # z-norm over successful only
         scored = rewards_from_raw(df.loc[attempted], norm) # score success + fail
         df.loc[attempted, REWARD_COLS] = scored[REWARD_COLS].values
-    # else: every attempt failed → no valid z-norm yet → all rows get sentinel penalty.
+    # Without successful measurements, apply failure penalties without fitting normalization.
 
-    # Failed rows came back NaN from rewards_from_raw's mask; overwrite with penalty
-    # so BO sees them as observed-but-bad and stops re-suggesting the region.
+    # Replace failed rows' missing rewards with the fixed penalty.
     _apply_failure_penalty(df, attempted)
 
     write_csv_atomic(df, db_path, revision)
@@ -183,7 +170,7 @@ def _conc_key(row):
 
 
 def concentration_keys(frame):
-    # Keep Python rounding bcs numpy rounding can differ at half-grid values.
+    # Keep Python rounding because NumPy can differ at half-grid values.
     return [_rounded_concentrations(values)
             for values in frame[CONC_COLS].itertuples(index=False, name=None)]
 
@@ -199,9 +186,7 @@ def sync_results_into_pool(pool_path, results_path):
         if missing:
             raise ValueError(f"[sync_results_into_pool] {label} missing columns: {missing}")
 
-    # Sync ALL robot-attempted rows — success AND failure (n_osc=0, interp_*=NaN).
-    # Filtering by interp_period_mean_s.notna() (old behavior) drops failed runs,
-    # leaving BO blind to "this region doesn't oscillate" → wasted batches.
+    # Synchronize all attempted experiments, including failures with missing raw metrics.
     res_attempted = res[_attempted(res)]
     if res_attempted.empty:
         return 0
@@ -209,15 +194,15 @@ def sync_results_into_pool(pool_path, results_path):
     for _, r in res_attempted.iterrows():
         res_by_conc.setdefault(_conc_key(r), r) # first attempted row per concentration
 
-    # failure_mode travels with the row: without it the pool keeps n_osc=0 but loses WHY,
-    # and the pool is what BO trains on and what the analysis reads.
+    # Preserve failure labels when synchronizing results into the pool.
     if FAILURE_MODE_COL in res.columns and FAILURE_MODE_COL not in pool.columns:
         pool[FAILURE_MODE_COL] = pd.NA
     fill_cols = [c for c in RAW_COLS + ["exp_id", FAILURE_MODE_COL]
                  if c in pool.columns and c in res.columns]
-    if "exp_id" in fill_cols:
-        pool["exp_id"] = pool["exp_id"].astype("object") # avoid float→str dtype warning
-    # Idempotency: a pool row already has an exp_id → already synced; skip.
+    for column in ("exp_id", FAILURE_MODE_COL):
+        if column in fill_cols:
+            pool[column] = pool[column].astype("object")
+    # Skip pool rows that already have an experiment ID.
     pool_synced = _attempted(pool)
     n_filled = 0
     pending = pool.loc[~pool_synced, CONC_COLS]
@@ -238,7 +223,16 @@ def save_norm(norm: dict, path):
 
 
 def load_norm(path):
-    return json.loads(Path(path).read_text())
+    norm = json.loads(Path(path).read_text())
+    try:
+        for column in _ZCOLS:
+            values = np.asarray(norm[column], dtype=float)
+            if values.shape != (2,) or not np.isfinite(values).all() or values[1] < 0:
+                raise ValueError(column)
+            norm[column] = values.tolist()
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError('[rewards] Invalid saved normalization; restore finite means and non-negative standard deviations before resuming') from error
+    return norm
 
 
 @locked_dataset
@@ -257,7 +251,7 @@ def score_with_frozen(db_path, norm_path):
     attempted = _attempted(df)
     if not attempted.any():
         return 0
-    osc_rows = attempted & df["interp_period_mean_s"].notna()
+    osc_rows = attempted & (pd.to_numeric(df["n_osc"], errors="coerce") > 0)
 
     norm_path = Path(norm_path)
     if norm_path.exists():
@@ -267,14 +261,12 @@ def score_with_frozen(db_path, norm_path):
         save_norm(norm, norm_path)
         print(f"[rewards] froze z-norm on {int(osc_rows.sum())} oscillating rows → {norm_path}")
     else:
-        # Every attempt failed and no norm exists yet — apply penalty to the failed
-        # rows now (so they leave heldout) and wait for a successful run to freeze.
+        # Defer normalization until successful measurements are available.
         norm = None
 
     n_scored = 0
     if norm is not None:
-        # Only score NEW (unscored) successful rows. Failed rows come back NaN
-        # from rewards_from_raw's mask; the penalty fills them in below.
+        # Score only successful rows that do not already have rewards.
         new_osc = osc_rows & df["reward_oscillation"].isna()
         if new_osc.any():
             scored = rewards_from_raw(df.loc[new_osc], norm)

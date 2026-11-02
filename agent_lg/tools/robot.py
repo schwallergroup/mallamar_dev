@@ -75,6 +75,10 @@ def _tool_submit_protocol(json_path: str = None, proto_path: str = None,
 
     journal = None
     try:
+        campaign = os.getenv('OCEAN_CAMPAIGN_DB')
+        if campaign and (not _batch_id or not _db_path
+                         or Path(_db_path).expanduser().resolve() != Path(campaign).expanduser().resolve()):
+            raise ValueError('Campaign submission requires the current internal batch and dataset identity')
         load_protocol(json_path)
         if _batch_id and _db_path:
             journal = BatchJournal(_db_path, _batch_id)
@@ -115,9 +119,7 @@ def _tool_submit_protocol(json_path: str = None, proto_path: str = None,
                if Path(ROBOT_SCRIPT).resolve() == mailbox_worker
                else [sys.executable, ROBOT_SCRIPT, json_path])
     try:
-        #! Run the robot script as a subprocess, passing the JSON path as an argument.
-        # No wall-clock timeout here: liveness is governed by the robot heartbeat
-        # inside run_experiment (io_mailbox.py), which exits 75 on a genuine stall.
+        # Run the robot worker with heartbeat-based stall detection instead of a wall-clock deadline.
         result = subprocess.run(
             command,
             capture_output=True, text=True, env=worker_environment,
@@ -151,7 +153,7 @@ def _tool_submit_protocol(json_path: str = None, proto_path: str = None,
 def _tool_wait_for_result(concs: list, db_path: str,
                           poll_s: float = 30.0, timeout_s: float = 36_000.0,
                           qc_after_n: int | None = None, qc_volume_uL: float = 1900.0,
-                          **_ignored):
+                          _qc_runner=None, **_ignored):
     """Wait for all submitted experiments to appear in db_path."""
     if qc_after_n is None:
         qc_after_n = QC_AFTER_N_EXPERIMENTS
@@ -197,7 +199,7 @@ def _tool_wait_for_result(concs: list, db_path: str,
         except (TypeError, ValueError):
             return float("nan")
 
-    def extract(row, conc): # extract relevant info from the db row to return to the agent, e.g. n_osc, period_mean_s, etc. Adjust as needed based on your db schema and what info you want to return.
+    def extract(row, conc): # Return the measured metrics shown to the agent.
         return {"conc": conc, "exp_id": str(row["exp_id"]),
                 "n_osc": _safe_int(row.get("n_osc", 0)),
                 "period_mean_s": _safe_float(row.get("interp_period_mean_s", np.nan)),
@@ -208,13 +210,10 @@ def _tool_wait_for_result(concs: list, db_path: str,
     qc_triggered = False
     deadline = time.monotonic() + timeout_s
 
-    # In single-pool mode the robot writes a SEPARATE experiments_db.txt sibling;
-    # poll that for new measured rows (not the pool itself, which the robot never
-    # writes). Legacy mode → poll db_path as before.
+    # Poll the robot results file, which is separate from the pool in single-pool campaigns.
     poll_path = _results_db_path(db_path)
 
-    # Do a first pass immediately (don't sleep first) — if submit_protocol already
-    # filled the DB, we match right away and exit.
+    # Check for results immediately before waiting between polls.
     first_pass = True
     cached_collection = record.get("collection_result")
     if cached_collection:
@@ -241,7 +240,7 @@ def _tool_wait_for_result(concs: list, db_path: str,
         if qc_after_n > 0 and not qc_triggered and len(found) >= qc_after_n: # Mid batch QC
             qc_triggered = True
             print(f"[wait_for_result] {qc_after_n} results reached — triggering mid-batch QC …")
-            qc_result = _tool_run_qc(volume_uL=qc_volume_uL, db_path=db_path,
+            qc_result = (_qc_runner or _tool_run_qc)(volume_uL=qc_volume_uL, db_path=db_path,
                                      _batch_id=f"{journal.batch_id}:mid_qc" if journal else None)
             if qc_result.get("status") != "ok":
                 print(f"[wait_for_result] QC FAILED — aborting. Details: {qc_result}")
@@ -253,16 +252,7 @@ def _tool_wait_for_result(concs: list, db_path: str,
         if not pending:
             break
 
-    # Deadline expired with experiments still unaccounted for. The robot reported
-    # `finished` (or nothing at all) and no row ever appeared, so we cannot know what
-    # happened to them — but leaving them unrecorded is what made a dropped experiment
-    # cost the full timeout and then report partial success as if complete: the batch
-    # looked done, bo_iter advanced on the survivors, and the missing points stayed
-    # candidates forever.
-
-    # Record them as attempted failures (n_osc=0, so the existing hard penalty applies
-    # and the campaign moves on) but tagged `no_result`, NOT `chemistry` — nobody
-    # measured this composition, so it must never be read as evidence about it.
+    # Record missing results as no_result failures so they leave the candidate pool without becoming chemistry evidence.
     if pending and not cached_collection:
         try:
             n_written = _record_unresolved(poll_path, pending, col_map)
@@ -280,9 +270,7 @@ def _tool_wait_for_result(concs: list, db_path: str,
         outcome["batch_id"] = journal.batch_id
         journal.collected(outcome)
 
-    # Single-pool mode: pull the robot's freshly-measured rows from the SEPARATE
-    # experiments_db.txt into the pool's matching candidate rows (fill interp_*), so a
-    # measured candidate leaves heldout on the next BO read.
+    # Copy robot results into matching pool rows before the next BO selection.
     if os.getenv("OCEAN_CAMPAIGN_DB"):
         try:
             n_synced = sync_results_into_pool(db_path, poll_path)
@@ -295,10 +283,7 @@ def _tool_wait_for_result(concs: list, db_path: str,
         except Exception as e:
             return {**outcome, "abort": True, "error": str(e), "step": "pool_sync"}
 
-    # Then compute rewards from interp_* per the chosen mode (OCEAN_REWARD_MODE):
-    #   off       → leave rewards alone (dummy/test runs; default)
-    #   recompute → refit z-norm over ALL observed each batch, re-score everything
-    #   freeze    → fit z-norm ONCE on the first batch, score only new rows with it
+    # Apply the selected reward mode: unchanged, refitted normalization or frozen normalization.
     reward_mode = os.getenv("OCEAN_REWARD_MODE", "off")
     if reward_mode not in ("off", "recompute", "freeze"):
         return {**outcome, "abort": True, "error": f"Unknown reward mode: {reward_mode}", "step": "reward_validation"}
@@ -344,8 +329,7 @@ def _tool_run_qc(volume_uL: float, db_path: str,
     except (TypeError, ValueError) as error:
         return {"status": "error", "error": str(error)}
 
-    # Write QC JSON (same format as BO suggestions so robot.py handles both identically)
-    # Include QC-specific run parameters if configured
+    # Write QC concentrations and run settings in the standard batch format.
     proto = {
         "label": "qc",
         "volume_uL": volume_uL,
@@ -357,9 +341,7 @@ def _tool_run_qc(volume_uL: float, db_path: str,
     out_path = Path(db_path).parent / ".mallamar" / "qc_protocol.json"
     write_json_atomic(out_path, proto)
 
-    # Single-pool: QC results land in the robot's SEPARATE experiments_db.txt
-    # (= db_path when not in single-pool mode). Poll that file, and snapshot its
-    # existing exp_ids BEFORE submit so we only match NEW QC rows.
+    # Snapshot existing result IDs before submitting QC so only new measurements can match.
     qc_poll_path = _results_db_path(db_path)
     try:
         seen_ids = set(read_csv(qc_poll_path)["exp_id"].astype(str).tolist())
@@ -392,8 +374,7 @@ def _tool_run_qc(volume_uL: float, db_path: str,
     pending, found = matcher.pending, []
     deadline = time.monotonic() + timeout_s
 
-    # Do a first pass immediately (don't sleep first) — if robot already
-    # filled the DB, we match right away and exit.
+    # Check for QC results immediately before waiting between polls.
     first_pass = True
     while time.monotonic() < deadline:
         if not first_pass:

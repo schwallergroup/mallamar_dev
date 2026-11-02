@@ -124,12 +124,7 @@ def weighted_maximin(distances, weights, n_select):
 
 
 class RoughnessInitializer(Initializer):
-    """Balance local reward changes with distance from the already selected rows.
-
-    Roughness is mean neighbour reward distance / (input distance + eps).
-    Selection maximizes roughness times distance from the current seed set.
-    Input features are used directly, including token IDs when those are provided.
-    """
+    """Select rows by local reward variation and seed distance in supplied features, including token IDs."""
     requires_y = True
     skip_featurizer = True
 

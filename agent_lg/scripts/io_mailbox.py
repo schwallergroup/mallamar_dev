@@ -98,9 +98,35 @@ class MailboxClient:
     def _save_seq(self, sequence_number: int):
         atomic_write(self.sequence_path, lambda temporary: temporary.write_text(str(sequence_number), encoding="utf-8"))
 
+    def _sequence_history(self):
+        """Read prior mailbox records before allocating a new sequence."""
+        for path in (self.command_path, self.status_path):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            if (path == self.status_path and isinstance(record, dict)
+                    and record.get("state") == "idle" and "seq" not in record):
+                continue
+            yield record
+        try:
+            with self.command_archive.open(encoding="utf-8") as archive:
+                for line in archive:
+                    if line.strip():
+                        yield json.loads(line)
+        except FileNotFoundError:
+            return
+
     def _next_seq(self):
         with FileLock(self.sequence_path):
-            sequence_number = self._load_seq() + 1
+            sequence_number = self._load_seq()
+            for record in self._sequence_history():
+                if (not isinstance(record, dict) or isinstance(record.get("seq"), bool)
+                        or not isinstance(record.get("seq"), int) or record["seq"] < 0):
+                    raise RuntimeError('[mailbox] Invalid sequence history; reconcile mailbox records before posting')
+                if record["seq"] > sequence_number:
+                    raise RuntimeError('[mailbox] Sequence file is behind mailbox history; reconcile it before posting')
+            sequence_number += 1
             self._save_seq(sequence_number)
             return sequence_number
 
@@ -177,10 +203,10 @@ class MailboxClient:
         exp = normalize_experiment(exp) # reject invalid concentrations and builder hints before posting
         if isinstance(index, bool) or int(index) < 1 or float(index) != int(index):
             raise ValueError("[MailboxClient] Experiment index must be a positive integer")
-        # Build command payload (NO protocol path here)
+        # Send concentrations for the hardware listener to build the protocol.
         command_payload = {
             "sender": "optimizer",
-            "command": "run_concentrations", # key change
+            "command": "run_concentrations",
             "index": int(index),
             "requires_init": True, # HW will run 00_INIT before the protocol
             "concentrations": {
@@ -189,7 +215,7 @@ class MailboxClient:
                 "H2SO4": exp.get("conc_H2SO4_M"),
                 "Ru": exp.get("conc_Ru_M"),
             },
-            # optional HW builder hints (all optional)
+            # Optional hardware protocol settings.
             "builder_params": {
                 "target_volume_uL": exp.get("target_volume_uL"),
                 "set_temperature_C": exp.get("set_temperature_C"),
@@ -205,9 +231,7 @@ class MailboxClient:
             return cached
         print(f"[BO] Waiting for seq={sequence_number} idx={index}")
 
-        # Wait for completion; only missing heartbeats trigger a timeout.
-        # The controller must update status regularly, even during week-long runs.
-        # On timeout, the robot may still be running—verify before retrying.
+        # Require periodic robot heartbeats; a timeout does not confirm that the robot has stopped.
 
         poll_s = 1.0
         stall_timeout_s = float(exp.get("stall_timeout_s") or 172800.0) # 2 days for long BZ experiments
@@ -227,8 +251,7 @@ class MailboxClient:
                     if progress:
                         print(f"[BO] seq={sequence_number} {state}: step {progress.get('step')}/{progress.get('total_steps')} {progress.get('name')}")
 
-            # Heartbeat: a change in seq/state/progress OR in the snapshot's mtime
-            # means the robot is alive — reset the stall clock.
+            # Reset the stall timer when robot status or the snapshot modification time changes.
             try:
                 mtime = self.status_path.stat().st_mtime
             except Exception:
@@ -266,8 +289,7 @@ class MailboxClient:
             return cached
         print(f"[BO] Waiting for end_batch seq={sequence_number}")
 
-        # Wait for HW to finish the END protocol
-        # END protocol takes ~12-15 minutes, but allow up to 1 day for safety
+        # Allow up to one day for the hardware shutdown protocol to finish.
         poll_s = 2.0
         stall_timeout_s = 86400.0 # 1 day for END protocol
         last_beat = time.monotonic()

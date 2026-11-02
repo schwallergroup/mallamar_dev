@@ -149,8 +149,7 @@ class CampaignDataModule(BaseDataModule):
         if torch.isinf(self.y).any():
             raise ValueError("Campaign objectives contain infinite values")
 
-    # Split the data into training and held-out sets, ensuring only observed rows are used for training.
-    # Necessary for SDL to correctly handle partially measured campaign pools
+    # Split campaign pools so only measured objectives enter training.
     def split_data(self):
         if not self._pool_mode:
             return super().split_data()
@@ -158,16 +157,15 @@ class CampaignDataModule(BaseDataModule):
         missing = torch.isnan(self.y).any(1)
         observed = torch.where(~missing)[0]
 
-        # Fresh campaigns may have fewer observations than the configured PCA
-        # dimension or initialization size. 
+        # Limit PCA dimensions and initialization size to the available observations.
 
         if self.initializer.pca_dim is not None:
-            self.initializer.pca_dim = min(self.initializer.pca_dim, len(observed), self.x.shape[1]) # ensure PCA dimension does not exceed available observations or feature count
+            self.initializer.pca_dim = min(self.initializer.pca_dim, len(observed), self.x.shape[1])
 
         if self.initializer.n_clusters is not None:
             count = min(self.initializer.n_clusters, len(observed))
             self.initializer.n_clusters = count
-            self.initializer.initializer.n_clusters = count # ensure the initializer respects the available observations
+            self.initializer.initializer.n_clusters = count
 
         selected = self.initializer.fit(self.x[observed], y=self.y[observed]) 
         local = validate_indices(selected[0] if isinstance(selected, tuple) else selected, len(observed)) 

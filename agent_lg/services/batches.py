@@ -43,7 +43,7 @@ class CommandJournal:
             write_json_atomic(self.path, record)
 
     def confirm_terminal(self, key, result, evidence):
-        """Operator reconciliation when matching terminal hardware evidence is unavailable in the mailbox."""
+        """Record operator-verified terminal evidence for a hardware command."""
         if not isinstance(evidence, str) or not evidence.strip():
             raise ValueError('[CommandJournal] Record the verified hardware evidence')
         command = self.get(key)
@@ -90,15 +90,19 @@ class BatchJournal:
     def save(self, record):
         write_json_atomic(self.path, {**record, "batch_id": self.batch_id, "db_path": self.db_path})
 
-    def begin_submission(self, json_path, existing_ids):
+    def begin_submission(self, json_path, existing_ids, replay_source=None):
         digest = hashlib.sha256(Path(json_path).read_bytes()).hexdigest()
         with FileLock(self.path):
             record = self.load()
             if record:
+                if record.get("replay_source") != replay_source:
+                    raise RuntimeError("[BatchJournal] Replay and hardware submissions cannot be interchanged")
                 if record.get("protocol_sha256") != digest:
                     raise RuntimeError("[BatchJournal] Submitted batch has changed; inspect the original protocol")
                 if record.get("state") in ("submitted", "collected", "committed"):
                     return record["submission_result"]
+                if replay_source and record.get('state') in ('submitting', 'uncertain'):
+                    return None # deterministic replay can finish the same recorded submission
                 if record.get('state') in ('submitting', 'uncertain') and self.command_path.is_file():
                     ledger = json.loads(self.command_path.read_text(encoding='utf-8'))
                     journal = CommandJournal(self.command_path, ledger['mailbox_root'])
@@ -106,13 +110,23 @@ class BatchJournal:
                         raise RuntimeError('[BatchJournal] Command journal does not match the original protocol')
                     return None # worker will recover each original command, including unfinished ones
                 raise RuntimeError(f"[BatchJournal] Submission is {record.get('state')}; robot may still be running. Reconcile hardware and journal before retrying")
+            is_qc = self.batch_id.endswith((':qc', ':mid_qc'))
+            if not is_qc:
+                qc = BatchJournal(self.db_path, self.batch_id + ':qc').load()
+                if (qc.get('state') != 'committed'
+                        or qc.get('collection_result', {}).get('status') != 'ok'
+                        or qc.get('replay_source') != replay_source):
+                    raise RuntimeError('[BatchJournal] Successful QC is required for this batch before submission')
             _, suggestions = load_protocol(json_path)
             submitted = [suggestion.get('conc', suggestion) for suggestion in suggestions]
             if hashlib.sha256(Path(json_path).read_bytes()).hexdigest() != digest:
                 raise RuntimeError('[BatchJournal] Protocol changed while recording its compositions')
-            self.save({"state": "submitting", "submitted_concentrations": submitted,
-                       "kind": 'qc' if self.batch_id.endswith((':qc', ':mid_qc')) else 'experiment', "protocol_path": str(Path(json_path).resolve()),
-                       "protocol_sha256": digest, "existing_ids": sorted(existing_ids)})
+            record = {"state": "submitting", "submitted_concentrations": submitted,
+                       "kind": 'qc' if is_qc else 'experiment', "protocol_path": str(Path(json_path).resolve()),
+                       "protocol_sha256": digest, "existing_ids": sorted(existing_ids)}
+            if replay_source:
+                record["replay_source"] = replay_source
+            self.save(record)
         return None
 
     def finish_submission(self, result):

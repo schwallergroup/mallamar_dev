@@ -18,21 +18,7 @@ def shorten(x: str, n: int) -> str:
 
 
 def build_run_name(config: dict, prefix: str, max_len: int = 128) -> str:
-    """Build the descriptive W&B run name from a run config.
-
-    The name encodes surrogate/acquisition method, featurizer model, initializer
-    method, batch size, and seed, e.g.::
-
-        <prefix>-<model>-<surrogate>-<acqf>-<init>-batch_q<N>-seed<S>
-
-    Args:
-        config: The full run configuration dictionary.
-        prefix: Leading token (typically the auto-generated W&B run name).
-        max_len: Maximum length; the name is truncated to this many characters.
-
-    Returns:
-        The constructed run name string.
-    """
+    """Build a run name from its configuration and truncate it to max_len characters."""
     acqf_path = config.get("acquisition", {}).get("class_path", "")
     surrogate_path = config.get("surrogate_model", {}).get("class_path", "")
 

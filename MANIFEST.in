@@ -1,8 +1,9 @@
+include environment.yaml
 include requirements.txt
 include NOTICE
 include agent_lg/configs/t5gemma_s_joint.yaml
 recursive-include agent_lg/prompts *.md
-recursive-include vendor/alice *.py py.typed LICENSE
+recursive-include vendor/alice *.py py.typed LICENSE-ALICE
 prune tests
 prune build
 prune agent_lg/perspective_study

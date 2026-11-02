@@ -28,14 +28,7 @@ from alice.featurization.deep_multilayer import LLMFeaturizer
 
 class SlicingTransform(InputTransform, nn.Module):
     def __init__(self, start_idx: int, end_idx: int, transform_on_train: bool = True, transform_on_eval: bool = True, transform_on_fantasize: bool = True):
-        """
-        # Input tensor with 5 features
-        X = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
-
-        # Keep only features at indices 1, 2, 3
-        slicer = SlicingTransform(start_idx=1, end_idx=4)
-        X_sliced = slicer.transform(X)  # Returns [[2.0, 3.0, 4.0]]
-        """
+        """Select features in the half-open slice start_idx:end_idx along the final tensor dimension."""
         super().__init__()
         self.start_idx = start_idx
         self.end_idx = end_idx
@@ -70,9 +63,7 @@ class MultiDeepGP(SurrogateModel):
         freeze_embedder: bool = False,
         prev_finetuning_state_dict=None,
     ):
-        """
-        Applies slicing strategy within each GPs input transform if independent projection layers are used. 
-        """
+        """Configure objective-specific input slices for independent embedding projections."""
         super().__init__()
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
@@ -167,10 +158,7 @@ class MultiDeepGP(SurrogateModel):
             self.freeze_embedder()
 
     def freeze_embedder(self) -> None:
-        """Freeze the LoRA + projection-head parameters and rebuild the optimizer
-        with only the GP param group. Mirrors the __init__ optimizer/scheduler
-        construction minus the llm param group, so a frozen run is identical to
-        an unfrozen one except no gradients flow into the embedder."""
+        """Freeze LoRA and projection weights, then rebuild the optimizer to train only the GP."""
         for p in self.finetuning_model.parameters():
             p.requires_grad = False
         gp_params = list(self.model.parameters())
@@ -231,14 +219,7 @@ class MultiDeepGP(SurrogateModel):
 
 
 class FixedFeatureGP(SurrogateModel):
-    """Static-feature counterpart of :class:`DualDeepGP`.
-
-    This class intentionally matches the joint model's GP likelihood, kernel,
-    input/outcome transforms, optimizer, scheduler, and ten-epoch fit. Its only
-    difference is that the supplied features are held fixed. It is used for
-    both the frozen-T5Gemma and numerical-condition-vector baselines so the
-    representation, rather than the downstream GP, is the ablated component.
-    """
+    """Fit fixed-feature GP baselines with the joint model's kernel and training settings."""
 
     def __init__(
         self,

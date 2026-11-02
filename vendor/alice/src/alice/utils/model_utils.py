@@ -4,13 +4,7 @@ import torch
 from alice.bo.optimizer import BotorchOptimizer
 
 def save_checkpoint(bo_optimizer: BotorchOptimizer, iteration: int, base_dir: str="./checkpoints"):
-    """
-    Save a model checkpoint: the LoRA adapters plus the trained projection heads.
-    Args:
-        bo_optimizer (BotorchOptimizer):  Optimizer object for BO
-        iteration (int): Current iteration number for checkpoint naming
-        base_dir (str): Base directory for saving checkpoints
-    """
+    """Save LoRA adapters, projection heads and optional attention weights for one iteration."""
     checkpoint_dir = os.path.join(base_dir, f"iteration_{iteration}")
     try:
         os.makedirs(checkpoint_dir, exist_ok=True)

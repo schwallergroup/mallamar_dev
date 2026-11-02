@@ -16,7 +16,7 @@ def _tool_read_dataset(path: str):
     try:
         df = read_campaign_csv(path)
     except FileNotFoundError:
-        # guarding the hallucination here, jsut in case
+        # Validate the path supplied by the agent.
         campaign = os.getenv("OCEAN_CAMPAIGN_DB")
         if campaign and Path(campaign).exists() and Path(path) != Path(campaign):
             print(f"[read_dataset] path not found: {path!r} — single-pool mode, "
@@ -62,7 +62,9 @@ def _tool_analyze_space_coverage(db_path: str):
     rc = ["reward_oscillation"] if "reward_oscillation" in df.columns else []
     df_obs = df.dropna(subset=rc) if rc else df
     if len(df_obs) < 4:
-        return {"error": "Too few observed rows for PCA"}
+        return {"status": "insufficient_observations", "n_observed": len(df_obs),
+                "minimum_observations": 4,
+                "message": "Coverage PCA is available after at least four measured experiments."}
     X = df_obs[CONC_COLS].values.astype(float)
     variance, counts = sampling_coverage(X)
     return {
@@ -116,7 +118,7 @@ def _tool_check_suggestion_diversity(suggestions: list):
     skip = {"rxn_id", "batch_id", "iter", "suggestion_index"}
     all_numeric_keys = [k for k, v in suggestions[0].items()
                         if k not in skip and isinstance(v, (int, float))]
-    # Prefer BZ concentration keys when they are present AND carry real variation
+    # Prefer concentration features when they vary across suggestions.
     bz_keys = ["MA", "NaBrO3", "H2SO4", "Ru"]
     bz_present = all(k in suggestions[0] for k in bz_keys)
     if bz_present:
@@ -184,7 +186,7 @@ def _pareto_mask(points):
 
 
 def _compute_iteration_hv(db_path: str, batch_ids=None, campaign_ids=None):
-    """Read DB, compute current Pareto front and 2D HV. Its a progress tracker used by progress_tracker_node."""
+    """Compute measured Pareto membership and reporting hypervolume."""
     try:
         df = read_campaign_csv(db_path)
     except Exception as e:
@@ -207,7 +209,7 @@ def _compute_iteration_hv(db_path: str, batch_ids=None, campaign_ids=None):
         "ref_point": REF_POINT,
     }
 
-    # Which rows are on the front, by exp_id (provenance + the membership test).
+    # Record Pareto-front experiment IDs for improvement tracking.
     if "exp_id" in df_obs.columns:
         eids = df_obs["exp_id"].astype(str).values
         front_ids = [e for e, keep in zip(eids, on_front)
@@ -227,13 +229,13 @@ def _compute_iteration_hv(db_path: str, batch_ids=None, campaign_ids=None):
                 out["hv_campaign"] = 0.0
                 out["n_observed_campaign"] = 0
     elif batch_ids is not None:
-        # No exp_id column (legacy combined file) — membership is not decidable.
+        # Front membership cannot be compared without experiment IDs.
         out["n_new_pareto"] = None
     return out
 
 def _tool_analyze_final_results(db_path: str, baseline_n_obs: int = 0, **kwargs):
     """Analyze final results: reward stats, failure rate, new hits compared to baseline_n_obs."""
-    # Accept common alias variants the agent has been observed to use
+    # Accept common concentration aliases.
     if "baseline_n_observed" in kwargs:
         baseline_n_obs = int(kwargs["baseline_n_observed"])
     try:

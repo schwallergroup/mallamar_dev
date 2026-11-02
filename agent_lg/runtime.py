@@ -15,6 +15,8 @@ from agent_lg.config import CHECKPOINT_DB, AVAILABLE_CONFIGS, configure_configs
 from agent_lg.graph import build_graph
 from agent_lg.preflight import check_agentic_config, PreflightError
 from agent_lg.tools_registry import TOOL_MAP
+from agent_lg.tools.robot import _tool_wait_for_result
+from agent_lg.services.replay import ReplayController
 from agent_lg.services.validation import CampaignSafetyError
 from agent_lg.services.storage import FileLock
 from agent_lg.services.campaigns import CampaignSettings, CAMPAIGN_ENVIRONMENT
@@ -37,7 +39,7 @@ class CampaignSession:
             self.environment = {key: os.getenv(key) for key in keys}
             self.configs_dir = agent_config.CONFIGS_DIR
             self.configs = [(name, model_config, model_config['path']) for name, model_config in AVAILABLE_CONFIGS.items()]
-            self.wait_tool = TOOL_MAP['wait_for_result']
+            self.tools = TOOL_MAP.copy()
             self.stdout, self.stderr = sys.stdout, sys.stderr
             return self
         except BaseException:
@@ -56,7 +58,8 @@ class CampaignSession:
             for name, model_config, path in self.configs:
                 model_config['path'] = path
                 AVAILABLE_CONFIGS[name] = model_config
-            TOOL_MAP['wait_for_result'] = self.wait_tool
+            TOOL_MAP.clear()
+            TOOL_MAP.update(self.tools)
             if sys.stdout is not self.stdout or sys.stderr is not self.stderr:
                 cleanup_logging(self.stdout, self.stderr)
         finally:
@@ -136,7 +139,6 @@ def _prompt_approval(payload):
         print("Please type 'y' or 'n'.")
 
 
-# main campain driver
 @campaign_session
 def run_agent(
     user_message: str, # agent instructions
@@ -155,8 +157,9 @@ def run_agent(
     approval_input=None,
     campaign_mode: str | None = None,
     papers_dir: str | None = None,
+    replay_data: str | None = None,
 ):
-    """Run 6 BO (bo), 3 BO + 3 LLM (bo-llm, default) or 6 LLM (llm); resume keeps saved settings."""
+    """Run or resume six-point BO, mixed or LLM campaigns with saved settings."""
     load_dotenv(Path.cwd() / ".env") # use the caller's workspace
     if checkpoint_db == ":memory:":
         raise PreflightError("[campaign] Use a checkpoint file; in-memory campaigns cannot recover after a crash")
@@ -170,6 +173,8 @@ def run_agent(
         record = saved_settings.load()
         saved_record_present = record is not None # check campaign already exist
         if record is not None:
+            if dry_run and not record['settings']['dry_run']:
+                raise ValueError('dry_run differs from the original hardware campaign; start a new campaign for dry-run')
             options = saved_settings.restore(record)
             db_path, user_message = options['db_path'], options['user_message']
             model_name, backend, base_url = options['model_name'], options['backend'], options['base_url']
@@ -200,17 +205,42 @@ def run_agent(
     if pool and Path(pool).expanduser().resolve() != Path(db_path).expanduser().resolve():
         raise PreflightError('[campaign] OCEAN_CAMPAIGN_DB differs from db_path; provide one campaign pool')
     os.environ['OCEAN_CAMPAIGN_DB'] = db_path # the Python API and CLI share the explicit pool
+    if replay_data is not None:
+        source = str(Path(replay_data).expanduser().resolve())
+        if not dry_run:
+            raise PreflightError('[replay] Use replay_data with dry_run=True')
+        if record is not None and source != os.getenv('MALLAMAR_REPLAY_DATA'):
+            raise CampaignSafetyError('[replay] Source differs from the original campaign')
+        os.environ['MALLAMAR_REPLAY_DATA'] = source
+    elif record is None:
+        os.environ.pop('MALLAMAR_REPLAY_DATA', None)
 
     if record is None:
         os.environ.pop('MALLAMAR_ARTIFACTS_RECORD', None)
     else:
         os.environ['MALLAMAR_ARTIFACTS_RECORD'] = str(saved_settings.path)
-    if record is None and not os.getenv('OCEAN_HYPOTHESIS_PATH'):
+    if record is None and (os.getenv('MALLAMAR_REPLAY_DATA') or not os.getenv('OCEAN_HYPOTHESIS_PATH')):
         os.environ['OCEAN_HYPOTHESIS_PATH'] = str(Path(db_path).parent / '.mallamar' / 'hypotheses' / (saved_settings.path.stem + '.json'))
     log_file, orig_stdout, orig_stderr = setup_logging(db_path)
 
     try:
-        if dry_run: # preliminary testing 
+        replay = None
+        if os.getenv('MALLAMAR_REPLAY_DATA'):
+            if not dry_run or reward_mode not in ('recompute', 'freeze'):
+                raise PreflightError('[replay] Use --dry-run with --reward-mode recompute or freeze')
+            try:
+                replay = ReplayController(os.environ['MALLAMAR_REPLAY_DATA'], db_path)
+            except (OSError, ValueError) as error:
+                raise PreflightError(str(error)) from error
+            os.environ['MALLAMAR_DRY_RUN'] = '1'
+            os.environ['OCEAN_RESULTS_DB'] = str(replay.results_path)
+            os.environ['OCEAN_RESULTS_ROOT'] = str(Path(db_path).parent / 'results_MOBBOL')
+            os.environ.pop('OCEAN_MAILBOX_ROOT', None)
+            os.environ.pop('MALLAMAR_REFERENCE_DATASETS', None)
+            TOOL_MAP['submit_protocol'] = lambda arguments: replay.submit(**arguments)
+            TOOL_MAP['run_qc'] = lambda arguments: replay.run_qc(**arguments)
+            TOOL_MAP['wait_for_result'] = lambda arguments: _tool_wait_for_result(**arguments, _qc_runner=replay.run_qc)
+        elif dry_run: # legacy smoke test; full replay uses the controller above
             os.environ["MALLAMAR_DRY_RUN"] = "1" # real mailbox commands are disabled for this call
             def _mock_wait_for_result(concs, db_path, **_):
                 print(f"[DRY-RUN] wait_for_result mocked — returning {len(concs)} fake result(s).")
@@ -231,15 +261,19 @@ def run_agent(
        # Restore config paths and validate campaign inputs before building the agents.
         os.environ["OCEAN_REWARD_MODE"] = reward_mode
         configure_configs()
-        check_agentic_config(db_path=db_path)
-
         with CampaignLock(checkpoint_db, thread_id, db_path):
+            if replay:
+                try:
+                    replay.prepare()
+                except (OSError, ValueError) as error:
+                    raise PreflightError(str(error)) from error
+                print('[DRY-RUN] Dataset replay; QC is simulated and no robot commands are sent.')
+            check_agentic_config(db_path=db_path)
             if record is None:
                 with SqliteSaver.from_conn_string(checkpoint_db) as saver:
                     if saver.get({'configurable': {'thread_id': thread_id}}):
                         raise CampaignSafetyError('[settings] Legacy checkpoint has no saved settings. Reconcile its original configuration before adopting it; defaults cannot recover it safely')
 
-                # Create a new settings record here if none exists
                 record = saved_settings.create({'db_path': str(Path(db_path).expanduser().resolve()), 'user_message': user_message,
                         'model_name': model_name, 'backend': backend, 'base_url': base_url,
                         'auto_approve': auto_approve, 'dry_run': dry_run, 'reward_mode': reward_mode,
@@ -262,7 +296,6 @@ def run_agent(
             config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
 
             with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
-                # * the graph is built with the model and checkpointer, ready for execution.
                 graph = build_graph(model, auto_approve=auto_approve, checkpointer=checkpointer)
 
                 existing = checkpointer.get(config)
@@ -299,14 +332,12 @@ def run_agent(
                     "target_bo_iters": n_bo_iters,
                 }
 
-                # If the thread is already paused at a human-approval interrupt 
-                # (like the operator quit and re-ran), resume from there; otherwise start fresh.
+                # Resume a pending approval interrupt when restoring an existing campaign.
                 pending = _pending_interrupts(graph.get_state(config)) if existing else []
                 next_input = (Command(resume=approval_input if approval_input is not None else _prompt_approval(pending[0])) if pending
                               else None if existing else initial_input) # resume the checkpoint
 
-                # Drive the graph, pausing for an inline operator y/n on every interrupt
-                # (unless --auto-approve, in which case the gate never fires).
+                # Run the graph, requesting operator approval at each interrupt.
                 while True:
                     for _ in graph.stream(next_input, config=config, stream_mode="values"):
                         pass
@@ -341,6 +372,8 @@ def resume_agent(
     recursion_limit: int = None,
     campaign_mode: str | None = None,
     papers_dir: str | None = None,
+    replay_data: str | None = None,
+    dry_run: bool | None = None,
 ):
     """Resume using saved settings; explicit method changes are rejected."""
     saved_settings = CampaignSettings(checkpoint_db, thread_id)
@@ -354,9 +387,11 @@ def resume_agent(
             raise ValueError('[method] campaign_mode differs from the original campaign')
         if papers_dir is not None and str(Path(papers_dir).expanduser().resolve()) != record['environment'].get('OCEAN_CORPUS_DIR'):
             raise ValueError('[method] papers_dir differs from the original campaign')
+        if replay_data is not None and str(Path(replay_data).expanduser().resolve()) != record['environment'].get('MALLAMAR_REPLAY_DATA'):
+            raise ValueError('[replay] Source differs from the original campaign')
         overrides = {'model_name': model_name, 'backend': backend, 'base_url': base_url,
                      'auto_approve': auto_approve, 'reward_mode': reward_mode,
-                     'db_path': db_path, 'recursion_limit': recursion_limit}
+                     'db_path': db_path, 'recursion_limit': recursion_limit, 'dry_run': dry_run}
         for key, value in overrides.items():
             if key == 'db_path' and value is not None:
                 value = str(Path(value).expanduser().resolve())

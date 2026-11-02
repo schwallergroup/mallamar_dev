@@ -1,5 +1,5 @@
 # Keep campaign recipes, prompts, papers and model revisions stable across restarts.
-import hashlib, json, logging, os
+import glob, hashlib, json, logging, os
 from pathlib import Path
 from huggingface_hub import HfApi, try_to_load_from_cache
 from agent_lg.config import DEFAULT_CONFIGS_DIR as CONFIGS_DIR
@@ -31,6 +31,10 @@ def artifact_files(scopes):
 def capture_artifacts():
     scopes = [{'path': str(Path(os.getenv('MALLAMAR_CONFIGS_DIR') or CONFIGS_DIR).expanduser().resolve()), 'patterns': ['*.yaml', '*.yml']},
               {'path': str((Path(__file__).parents[1] / 'prompts').resolve()), 'patterns': ['*.md']}]
+    replay = os.getenv('MALLAMAR_REPLAY_DATA')
+    if replay:
+        source = Path(replay).expanduser().resolve()
+        scopes.append({'path': str(source.parent), 'patterns': [glob.escape(source.name)]})
     corpus = LocalCorpus()
     if corpus.path is not None:
         scopes.append({'path': str(corpus.path), 'patterns': list(corpus.patterns)})

@@ -2,7 +2,7 @@
 
 Mallamar installs the Python package in `src/alice` through its root environment and packaging. This copy contains the runtime modules needed for Bayesian optimization; use [the upstream ALICE repository](https://github.com/schwallergroup/alice) for its standalone training runner, benchmark configurations and datasets.
 
-Mallamar-specific changes are recorded in the root `NOTICE`. The upstream license is retained in `LICENSE`.
+Mallamar-specific changes are recorded in the root `NOTICE`. The upstream license is retained in `LICENSE-ALICE`.
 
 ## Citation
 
@@ -23,7 +23,7 @@ Mallamar-specific changes are recorded in the root `NOTICE`. The upstream licens
 
 ## License
 
-This project is licensed under the **Apache 2.0 License**. See the `LICENSE` file for details.
+This project is licensed under the **Apache 2.0 License**. See the `LICENSE-ALICE` file for details.
 
 ---
 

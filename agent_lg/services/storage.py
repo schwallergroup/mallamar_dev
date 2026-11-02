@@ -19,16 +19,25 @@ def read_csv(path, **options):
 
 def read_campaign_csv(path, **options):
     requested = Path(path).expanduser().resolve()
+    source = os.getenv('MALLAMAR_REPLAY_DATA')
+    if source and requested.exists() and requested.samefile(Path(source).expanduser().resolve()):
+        raise ValueError('[replay] Unrevealed source data is outside the current campaign view')
     if requested.suffix.lower() not in (".csv", ".txt", ".tsv"):
         raise ValueError("Expected a tabular CSV/TXT/TSV dataset, not a protocol JSON or document")
     campaign = os.getenv("OCEAN_CAMPAIGN_DB")
     if campaign:
         campaign = Path(campaign).expanduser().resolve()
-        permitted = {campaign, campaign.with_name('experiments_db.txt')}
+        permitted = {campaign}
         if os.getenv("OCEAN_RESULTS_DB"):
             permitted.add(Path(os.environ["OCEAN_RESULTS_DB"]).expanduser().resolve())
-        permitted.update(Path(item).expanduser().resolve() for item in os.getenv("MALLAMAR_REFERENCE_DATASETS", "").split(os.pathsep) if item)
+        if not source:
+            permitted.add(campaign.with_name('experiments_db.txt'))
+            for item in os.getenv("MALLAMAR_REFERENCE_DATASETS", "").split(os.pathsep):
+                if item:
+                    permitted.add(Path(item).expanduser().resolve())
         if requested not in permitted:
+            if source:
+                raise ValueError(f"[replay] Dataset is outside the current campaign: {path}. Use the masked pool or collected replay results")
             raise ValueError(f"Dataset is outside the current campaign: {path}. Explicit reference datasets must be listed in MALLAMAR_REFERENCE_DATASETS")
     return read_csv(requested, **options)
 

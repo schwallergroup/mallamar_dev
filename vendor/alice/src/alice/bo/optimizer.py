@@ -21,33 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class BotorchOptimizer:
-    """Surrogate-model + acquisition-function optimizer for the BO loop.
-
-    Instantiated once per run by ``setup_bo_optimizer`` in ``train_master.py``;
-    ``suggest_next_experiments`` is then called once per BO iteration.
-
-    Constructor arguments (source -> internal use):
-        surrogate_model_config: ``config["surrogate_model"]``. Instantiated and
-            fitted in ``train_surrogate_model`` (called per iteration).
-        acq_function_config: ``config["acquisition"]``. Resolved to an acqf class
-        via ``ACQF_REGISTRY``. Only ``init_args.ref_point`` is read from it, and
-            only for the Noisy EHVI variants; all other ``init_args`` keys are
-            ignored, since the constructor kwargs are set explicitly in ``suggest_next_experiments``.
-        batch_size: ``config["bo"]["init_args"]["batch_size"]``. Number of greedy
-            selection steps per iteration (``steps = min(batch_size, n_candidates)``).
-        max_eval_chunk: chunk size for ``batched_acqf_forward``. Not set by any
-            config or ``setup_bo_optimizer`` -> always the default (2048). Kept as a
-            tuning knob, but effectively constant in the shipped pipeline.
-        tkwargs: device/dtype dict, built by ``setup_bo_optimizer`` from ``dtype``.
-            Used throughout for tensor placement.
-
-    Attributes read OUTSIDE this class:
-        surrogate_model: read by ``save_checkpoint`` (``utils/model_utils.py``) to
-            persist the fitted featurizer/projection layer.
-
-    Internal-only attributes:
-        _shared_sampler: lazily-created ``SobolQMCNormalSampler`` reused across steps.
-    """
+    """Fit a surrogate and greedily select candidate batches using acquisition scores."""
     def __init__(
         self,
         surrogate_model_config: Optional[Dict[str, Any]] = None,
@@ -98,22 +72,7 @@ class BotorchOptimizer:
             raise
 
     def suggest_next_experiments(self, train_x: Tensor, train_y: Tensor, design_space: Tensor):
-        """Select the next batch of experiments from ``design_space``.
-
-        Refits the surrogate on the current data, then greedily picks
-        ``min(batch_size, len(design_space))`` points, adding each selection to
-        ``X_pending`` so later picks account for earlier ones.
-
-        Args:
-            train_x: Observed inputs, shape (n_train, d).
-            train_y: Observed objectives, shape (n_train, n_objectives).
-            design_space: Candidate pool to select from, shape (n_candidates, d).
-
-        Returns:
-            list[int]: Row indices into ``design_space`` of the selected points,
-            in selection order. ``train_master`` maps these to global dataset
-            indices via ``dm.heldout_indices``.
-        """
+        """Select candidate-row indices in batch order, refitting for non-random acquisition."""
         # getting the acquisition function class from the config file argument
         acqf_class_path = str(self.acq_function_config.get("class_path", ""))
         acqf_class = ACQF_REGISTRY.get(acqf_class_path) or ACQF_REGISTRY.get(acqf_class_path.split(".")[-1])
@@ -132,7 +91,7 @@ class BotorchOptimizer:
         if self._shared_sampler is None:
             self._shared_sampler = SobolQMCNormalSampler(sample_shape=torch.Size([256]))
 
-        # getting featurizer from finetuned model, defining featurizer, selected X, and possible choices
+        # Project observed and candidate inputs with the fitted featurizer.
         featurizer = getattr(self.surrogate_model, "finetuning_model", None)
         if featurizer is None:
             z_baseline = train_x.to(**self.tkwargs)
@@ -163,7 +122,7 @@ class BotorchOptimizer:
 
         selected_indices = []
 
-        # train data points are dropped before evaluation in train_master.py
+        # The caller excludes observed rows from the candidate pool.
         choices_idx = torch.arange(design_space.size(0), device=design_space.device)
 
         eval_matrix = z_choices.clone() # features of the design space

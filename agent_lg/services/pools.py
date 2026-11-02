@@ -96,13 +96,13 @@ class CampaignPool:
             if partially_scored.any() or np.isinf(rewards.to_numpy()).any():
                 raise ValueError('[CampaignPool] Partially scored or infinite objectives; finish scoring before BO')
 
-            # Identify rows that have complete reward information
+            # Identify rows with both rewards.
             has_rewards = ~missing_rewards.any(axis=1)
             experiment_ids = frame['exp_id'].fillna('').astype(str).str.strip()
             was_attempted = ~experiment_ids.isin(('', 'nan', 'NaN', 'None'))
             unscored_attempts = frame.index[was_attempted & ~has_rewards].tolist()
 
-            # Ensure that any attempted experiments have corresponding rewards before proceeding with BO
+            # Require rewards for every attempted experiment before BO.
             if unscored_attempts:
                 raise ValueError(f'[CampaignPool] Attempted rows {unscored_attempts[:8]} have missing rewards and would re-enter heldout; recover synchronization/scoring before BO (including when reward mode is off)')
             if experiment_ids[was_attempted].duplicated().any():

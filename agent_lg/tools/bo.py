@@ -64,8 +64,7 @@ def _tool_list_available_configs():
 
 
 def _tool_prepare_bo_dataset(prepare_py: str = None):
-    # Single-pool campaigns score measured rows in place; candidates keep NaN rewards.
-    # Rebuilding a separate dataset would discard this campaign state.
+    # Score measured rows in place while leaving unmeasured candidate rewards empty.
     campaign_db = os.getenv("OCEAN_CAMPAIGN_DB")
     if campaign_db:
         return {"returncode": 0,
@@ -170,8 +169,7 @@ def write_final_batch(json_path: str, suggestions: list):
         print(f"[write_final_batch] could not parse {p}: {type(e).__name__}: {e}")
         return None
 
-    # A single unambiguous Ru level across BO's own candidates can fill in for entries the
-    # agent re-typed without it (see _final_conc).
+    # Infer omitted Ru concentrations only when all BO candidates share one Ru level.
     _ru = set()
     for entry in (data if isinstance(data, list) else [data]):
         if isinstance(entry, dict):
@@ -183,8 +181,7 @@ def write_final_batch(json_path: str, suggestions: list):
                             _ru.add(round(float(cc[a]), 9)); break
     default_ru = _ru.pop() if len(_ru) == 1 else None
 
-    # (normalized conc, original entry) pairs — the original is needed so an injected
-    # point can be carried through verbatim rather than rebuilt.
+    # Pair normalized concentrations with original entries to preserve injected points.
     raw_list = list(suggestions or [])
     pairs = [(s, _final_conc(s, default_ru)) for s in raw_list]
     finals = [(c, raw) for raw, c in pairs if c]
@@ -192,10 +189,7 @@ def write_final_batch(json_path: str, suggestions: list):
         print("[write_final_batch] no usable final suggestions — keeping BO's batch.")
         return None
 
-    # NOTE: NEVER silently publish a shorter batch than we were handed. Dropping an
-    # unparseable entry means the robot runs N-k experiments while wait_for_result polls
-    # for all N — it then waits out its full timeout on results that were never
-    # submitted. Refusing keeps submission and polling pointed at the same batch.
+    # Reject unreadable entries so the submitted batch matches the results being awaited.
     unparsed = [i for i, (_, c) in enumerate(pairs) if not c]
     if unparsed:
         print(f"[write_final_batch] REFUSING write-back: {len(unparsed)} of {len(raw_list)} "
@@ -217,12 +211,7 @@ def write_final_batch(json_path: str, suggestions: list):
             if c:
                 built.setdefault(_conc_key(c), cand)
 
-    # Injected points (candidate INJECTION) legitimately have no BO-built protocol:
-    # they were snapped to unmeasured POOL rows by _tool_propose_experiments. That is
-    # safe in mailbox mode because the robot builds the protocol from concentrations
-    # (io_mailbox sends `concentrations` + `builder_params`, never a protocol path) —
-    # so a pool row needs nothing pre-built. Gated on OCEAN_BO_INJECT so the strict
-    # subset check still applies to every non-injection campaign.
+    # Injection mode accepts pool candidates without prebuilt protocols because the robot builds them from concentrations.
 
     allow_injected = bool(os.environ.get("OCEAN_BO_INJECT"))
 
@@ -501,7 +490,7 @@ def _tool_override_bo_suggestions(
 
 def _tool_generate_design_space(db_path: str, ranges: dict,
                                  n_points: int = 10_000, out_path: str = None):
-    """Generate a random design space of `n_points` within `ranges`, excluding points in `db_path` if it exists."""
+    """Generate bounded candidates, excluding conditions already present in db_path."""
     if out_path is None:
         return {"error": "Provide out_path for the candidate CSV.", "n_generated": 0}
     key_map = {"MA": "conc_MA_M", "NaBrO3": "conc_NaBrO3_M",
