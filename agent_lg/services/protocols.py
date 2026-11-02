@@ -108,3 +108,16 @@ def robot_experiments(data):
     protocol = validate_protocol(data) # check the whole batch before the first command
     parameters = protocol_parameters(protocol)
     return [{**normalize_experiment(suggestion), **parameters} for suggestion in protocol["suggestions"]]
+
+
+def reaction_prompt(row):
+    """Describe a candidate using the campaign concentration format."""
+    ma = row["conc_MA_M"]
+    ratio = row["conc_NaBrO3_M"] / ma if ma > 0 else float("nan")
+    return (
+        "The reaction is a Belousov-Zhabotinsky (BZ) reaction and the conditions are "
+        f"conc_NaBrO3_M: {row['conc_NaBrO3_M']}, "
+        f"ratio_NaBrO3_MA: {ratio:.4f}, "
+        f"conc_H2SO4_M: {row['conc_H2SO4_M']}, "
+        f"conc_Ru_M: {row['conc_Ru_M']}, "
+    )

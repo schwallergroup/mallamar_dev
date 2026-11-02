@@ -60,7 +60,7 @@ def load_corpus(dataset: str = "bz"):
     return _corpus_cache
 
 
-# Observed data table (the grounding that the ablation showed is load-bearing)
+# Ground hypotheses in observed measurements.
 
 def observed_table(db_path: str, max_rows: int = _MAX_OBS_ROWS):
     """Compact (concentrations -> reward) table of what the robot has measured."""
@@ -82,7 +82,7 @@ def observed_table(db_path: str, max_rows: int = _MAX_OBS_ROWS):
     head = "  ".join(_SHORT.get(c, c) for c in ccols) + "  | r_osc  r_sig"
     lines = [head]
     for _, r in obs.iterrows():
-        cpart = " ".join(f"{float(r[c]):.3f}" for c in ccols)
+        cpart = " ".join(f"{float(r[c]):.6g}" for c in ccols)
         rpart = " ".join(f"{float(r[c]):+.2f}" for c in rcols)
         lines.append(f"{cpart} | {rpart}")
     n_hidden = len(df.dropna(subset=rcols)) - len(obs)
@@ -150,17 +150,10 @@ class HypothesisStore:
         text = (text or "").strip()
         if not text:
             return {"stored": False, "reason": "empty hypothesis"}
-        # Static mode keeps the first hypothesis; normal campaigns can revise it.
-        if os.getenv("OCEAN_HYP_STATIC") and self.text:
+        unchanged = bool(self.text) and self._norm(text) == self._norm(self.text)
+        # Static mode preserves the text while allowing a recorded review.
+        if os.getenv("OCEAN_HYP_STATIC") and self.text and not unchanged:
             return {"stored": False, "reason": "static mode — hypothesis frozen"}
-
-        # Identical wording does not add another revision.
-        if self.text and self._norm(text) == self._norm(self.text):
-            return {"stored": False,
-                    "reason": "identical to the current hypothesis — nothing was revised. "
-                              "Either revise it against the new observations (cite the new "
-                              "points) or skip update_hypothesis entirely this iteration.",
-                    "n_revisions": len(self.history)}
 
         # Attribute revisions to the current graph iteration.
         env_iter = os.getenv("OCEAN_BO_ITER")
@@ -170,9 +163,13 @@ class HypothesisStore:
             except ValueError:
                 pass
 
-        history = self.history + [{"bo_iter": bo_iter, "hypothesis": text}]
-        self._save(text, history) # only report success after the revision is durable
-        self.history, self.text = history, text
+        if unchanged:
+            text = self.text
+        # Record explicit carry-forward once per iteration; restart retries reuse it.
+        if not (unchanged and self.history and self.history[-1].get('bo_iter') == bo_iter):
+            history = self.history + [{"bo_iter": bo_iter, "hypothesis": text}]
+            self._save(text, history) # only report success after the revision is durable
+            self.history, self.text = history, text
         return {"stored": True, "n_revisions": len(self.history),
                 "hypothesis_len": len(text), "bo_iter": bo_iter}
 

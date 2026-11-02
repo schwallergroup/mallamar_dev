@@ -29,8 +29,7 @@ class TeeOutput:
                 self.file.write(data)
                 self.file.flush()
             except (OSError, ValueError):
-                # Logging must never hide the exception that the agent is trying
-                # to report (notably Windows redirected-stream errno 22 errors).
+                # Keep console output available if the log stream fails.
                 self._disable_file()
         return written
 
@@ -60,9 +59,7 @@ def setup_logging(db_path: str):
     db_path_obj = Path(db_path)
     campaign_name = db_path_obj.parent.name if db_path_obj.parent.name else "campaign"
 
-    # Keep active logs on a local disk when OCEAN_LOG_DIR is provided. The
-    # mailbox may live on a mapped/network drive whose file handles can become
-    # temporarily invalid even while the experiment mailbox remains usable.
+    # Use OCEAN_LOG_DIR to keep logs off an unreliable network mailbox drive.
     if "OCEAN_LOG_DIR" in os.environ:
         log_dir = Path(os.environ["OCEAN_LOG_DIR"])
     elif "OCEAN_MAILBOX_ROOT" in os.environ:
@@ -104,8 +101,7 @@ def cleanup_logging(original_stdout, original_stderr):
     """Restore original stdout/stderr and close log files."""
     tee_stdout = sys.stdout
     tee_stderr = sys.stderr
-    # Restore first: even if closing a redirected Windows stream fails, later
-    # exception reporting still has valid stdout/stderr handles.
+    # Restore console streams before closing log files so cleanup errors remain visible.
     sys.stdout = original_stdout
     sys.stderr = original_stderr
     for stream in (tee_stdout, tee_stderr):

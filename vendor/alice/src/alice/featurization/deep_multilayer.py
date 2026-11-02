@@ -38,9 +38,7 @@ class TaskAttentionLayer(nn.Module):
 
 
 class BaseNNFeaturizer(nn.Module):
-    """
-    Base class for neural network-based featurizers.
-    """
+    """Base class for neural feature projections."""
     def __init__(
         self,
         input_dim: int = 768,
@@ -52,25 +50,12 @@ class BaseNNFeaturizer(nn.Module):
 
     @property
     def output_dim(self) -> int:
-        """
-        Returns the output dimension of the featurizer.
-        
-        Returns:
-            int: Output dimension
-        """
+        """Return the feature projection's output dimension."""
         return self._output_dim
 
     @abstractmethod
     def forward(self, x):
-        """
-        Forward pass through the neural network.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            torch.Tensor: Output tensor
-        """
+        """Transform an input tensor into learned features."""
         pass
 
 
@@ -85,18 +70,7 @@ class ConfigurableMLP(BaseNNFeaturizer):
         dropout: float = 0.1,
         use_spectral_norm: bool = True,
     ):
-        """
-        Configurable MLP for projecting embeddings to lower dimensions.
-
-        Args:
-            input_dim: Input feature dimension (embedding dimensions)
-            output_dim: Output projection dimension
-            hidden_dims: List of hidden layer sizes (empty list = single linear layer)
-            activation: Activation function ('elu', 'relu', or 'gelu')
-            use_layer_norm: Whether to apply LayerNorm after each linear layer
-            dropout: Dropout probability (applied after activations)
-            use_spectral_norm: Whether to constrain weights with spectral normalization
-        """
+        """Configure an embedding projection; empty hidden_dims gives a single linear layer."""
         super().__init__(input_dim=input_dim, projection_dim=output_dim)
 
         layers = []
@@ -343,7 +317,7 @@ class LLMFeaturizer(BaseNNFeaturizer):
             ]
 
             if self.use_task_attention:
-                # apply cross objective self attention by stacking different projectsion on top of each other
+                # Mix objective projections with cross-objective self-attention.
                 stacked_features = torch.stack(projection_outputs, dim=1)
                 aligned_features = self.attention_layer(stacked_features)
                 return torch.flatten(aligned_features, start_dim=1)

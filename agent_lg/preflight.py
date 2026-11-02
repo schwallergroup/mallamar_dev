@@ -4,11 +4,13 @@ from __future__ import annotations
 import os, logging, argparse
 from pathlib import Path
 from agent_lg.config import CONC_COLS
-from agent_lg.policy import resolve_improve_signal
+from agent_lg.rewards import RAW_COLS, REWARD_COLS
+from agent_lg.services.pools import check_campaign_pool
+from agent_lg.policy import resolve_improve_signal, agentic_axes_on
 
 from agent_lg.services.storage import read_csv
 from agent_lg.services.literature import LocalCorpus
-from agent_lg.services.validation import CampaignSafetyError
+from agent_lg.services.validation import CampaignSafetyError, integer_input, positive_input
 from agent_lg.services.method import CampaignRecipes
 from agent_lg.tools.hypothesis import store as hypothesis_store
 
@@ -35,41 +37,27 @@ def _corpus_problems(dataset: str = "bz", warnings: list[str] | None = None):
 
 
 def _pool_problems(db_path: str | None):
-    """Reasons candidate injection could not place a point."""
-    problems = []
-    # The API binds this pool from db_path before checking enabled axes.
-    pool = os.getenv("OCEAN_CAMPAIGN_DB")
+    """Check the campaign pool before any QC or robot submission."""
+    pool = os.getenv("OCEAN_CAMPAIGN_DB") or db_path
     if not pool:
-        problems.append(
-            "injection is ON but OCEAN_CAMPAIGN_DB is unset"
-            ".\n"
-            "      fix : run with --db <campaign_pool>.csv or call run_agent(db_path=...)\n"
-            "      why : proposals are snapped to unmeasured POOL rows; with no pool\n"
-            "            propose_experiments returns no_op and every batch is plain BO."
-        )
-        return problems
-
-    p = Path(pool)
-    if not p.exists():
-        problems.append(f"injection is ON but the pool does not exist: {p}")
-        return problems
-
+        return ["No campaign pool configured; use --db or run_agent(db_path=...)."]
+    path = Path(pool).expanduser().resolve()
+    if not path.is_file():
+        return [f"Campaign pool does not exist: {path}"]
     try:
-        df = read_csv(p, nrows=5000)
-    except Exception as e:
-        problems.append(f"injection is ON but the pool could not be read ({p}): "
-                        f"{type(e).__name__}: {e}")
-        return problems
-
-    missing = [c for c in CONC_COLS if c not in df.columns]
-    if missing:
-        problems.append(
-            f"injection is ON but the pool is missing concentration columns {missing}.\n"
-            f"      pool : {p}\n"
-            f"      why  : proposals are snapped in concentration space; without these\n"
-            f"             columns there is nothing to snap to."
-        )
-    return problems
+        frame = read_csv(path, nrows=1)
+        required = CONC_COLS + REWARD_COLS + ['exp_id', 'prompt']
+        if os.getenv('OCEAN_REWARD_MODE', 'off') in ('recompute', 'freeze'):
+            required += RAW_COLS
+        missing = [column for column in required if column not in frame]
+        if missing:
+            return [f"Campaign pool is missing columns: {missing}"]
+        if frame.empty:
+            return ['Campaign pool contains no candidates.']
+        check_campaign_pool(path, pending_batch=True) # unfinished batches are recovered before scoring checks
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+        return [f"Cannot use campaign pool {path}: {error}"]
+    return []
 
 
 def _improve_signal_problems(db_path: str | None):
@@ -95,13 +83,22 @@ def check_agentic_config(db_path: str | None = None, dataset: str = "bz",
     inject_on = bool(os.getenv("OCEAN_BO_INJECT"))
     filter_on = bool(os.getenv("OCEAN_BO_FILTER"))
     errors, warnings = [], []
+    if agentic_axes_on():
+        try:
+            positive_input(float(os.getenv("OCEAN_BO_LLM_TIMEOUT", "120")), "OCEAN_BO_LLM_TIMEOUT")
+        except ValueError:
+            errors.append("OCEAN_BO_LLM_TIMEOUT must be finite and positive.")
+        try:
+            integer_input(int(os.getenv("OCEAN_BO_LLM_RETRIES", "1")), "OCEAN_BO_LLM_RETRIES", minimum=0)
+        except ValueError:
+            errors.append("OCEAN_BO_LLM_RETRIES must be a non-negative integer.")
     try:
         CampaignRecipes().check_environment()
         CampaignRecipes().resolve(CampaignRecipes.config_key)
     except ValueError as error:
         errors.append(str(error))
 
-    # Injection implies hypothesis — that is the only form it was validated in.
+    # Injection requires hypothesis generation.
     if inject_on and not hyp_on:
         warnings.append("injection is ON without hypothesis mode; hypothesis is enabled "
                         "implicitly (proposals are meant to come from hypothesis windows).")
@@ -115,13 +112,13 @@ def check_agentic_config(db_path: str | None = None, dataset: str = "bz",
             except CampaignSafetyError as error:
                 errors.append(str(error))
 
-    # Only when the pareto signal is actually in play — an explicit
-    # OCEAN_IMPROVE_SIGNAL=hv5pct is a deliberate choice, not a misconfiguration.
+    # Check experiment IDs only when using Pareto-front improvement.
     if resolve_improve_signal() == "pareto":
         errors.extend(_improve_signal_problems(db_path))
 
-    if inject_on:
+    if inject_on or db_path or os.getenv('OCEAN_CAMPAIGN_DB'):
         errors.extend(_pool_problems(db_path))
+    if inject_on:
         n_agent = os.getenv("OCEAN_INJECT_N_AGENT")
         if not n_agent:
             errors.append(

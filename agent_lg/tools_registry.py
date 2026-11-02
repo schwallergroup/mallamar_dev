@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def _tool_finish_campaign(summary: str, db_path: str = None, _campaign_id=None):
-    """Finish the campaign by ensuring a report exists, then sending end_batch signal to hardware."""
+    """Ensure a campaign report exists, then send hardware cleanup."""
 
     completion_path = None
     command_path = None
@@ -54,31 +54,27 @@ def _tool_finish_campaign(summary: str, db_path: str = None, _campaign_id=None):
 
     result = {"status": "done", "summary": summary}
 
-    # Determine report location - prioritize campaign pool folder
+    # Store the report beside the pool, in the mailbox or in the caller's workspace.
     if db_path:
-        # Write report in same folder as campaign pool
         db_path_obj = Path(db_path)
         report_path = db_path_obj.parent / "campaign_report.md"
     elif "OCEAN_MAILBOX_ROOT" in os.environ:
-        # Fallback to mailbox root if db_path not provided
         mailbox_root = Path(os.environ["OCEAN_MAILBOX_ROOT"])
         report_path = mailbox_root / "campaign_report.md"
     else:
-        # Last resort: OCEAN repo root
         report_path = HERE / "campaign_report.md"
 
-    # Check if report already exists (written in last 5 minutes = fresh)
+    # Reuse reports written within the last five minutes.
     report_exists = report_path.exists()
     report_fresh = False
     if report_exists:
         age_seconds = time.time() - report_path.stat().st_mtime
         report_fresh = age_seconds < 300 # 5 minutes
 
-    # If no fresh report exists, generate a basic one from the summary
+    # Generate a summary report when no recent report exists.
     if not report_fresh:
         print(f"[finish_campaign] No recent report found at {report_path}, generating fallback report...")
 
-        # Generate basic report content
         report_content = f"""# Campaign Report
 
 **Generated**: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -210,20 +206,14 @@ def _parse_tool_calls_from_text(text: str):
                     start = None; continue
                 json_spans.append((start, i + 1))
                 name = obj.get("name") or obj.get("function")
-                # A real text-encoded call always declares its argument field,
-                # even when that field is an empty dict.  Agent summaries can
-                # contain tool-result objects such as
-                # {"name": "propose_experiments", "content": {...}}; treating
-                # those as fresh zero-argument calls restarts completed work.
+                # Require an explicit argument field so tool-result summaries cannot be mistaken for new calls.
                 arg_keys = ("arguments", "parameters", "input")
                 arg_key = next((key for key in arg_keys if key in obj), None)
                 args = obj.get(arg_key) if arg_key is not None else None
                 if isinstance(name, str) and name in known and isinstance(args, dict):
                     found.append({"name": name, "arguments": args})
                 start = None
-    # Python-style fallback. This is deliberately conservative: registered tool
-    # name, balanced parentheses, no positional args, and literal keyword values.
-    # It covers Qwen's common local-tool syntax without executing model text.
+    # Parse registered Python-style calls using literal keyword arguments without executing model text.
     for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", text):
         if any(start <= match.start() < end for start, end in json_spans):
             continue # quoted tool names in results/arguments are not another command
@@ -278,25 +268,12 @@ def _parse_tool_calls_from_text(text: str):
 
 @tool
 def finish_campaign(summary: str) -> str:
-    """Call when all campaign steps are done to finalize the campaign.
-
-    This tool will:
-    1. Check if a campaign report was written (recommended: call write_report first)
-    2. If no report exists, automatically generate a basic fallback report
-    3. Send end_batch signal to hardware for cleanup
-
-    Best practice: Call write_report with a comprehensive analysis BEFORE calling this.
-
-    Args:
-        summary: One-paragraph summary of what was accomplished
-
-    Returns:
-        Confirmation that campaign is finished and report is ensured"""
+    """Finish only after all batches: ensure a report, then send hardware cleanup."""
     return _dispatch("finish_campaign", {"summary": summary})
 
 @tool
 def search_literature(query: str, max_results: int = 5) -> str:
-    """Search arXiv for papers related to a query (BZ reaction, oscillation conditions, BO methods)."""
+    """Search arXiv for papers matching the query."""
     return _dispatch("search_literature", {"query": query, "max_results": max_results})
 
 @tool
@@ -306,12 +283,12 @@ def search_chemrxiv(query: str, max_results: int = 5) -> str:
 
 @tool
 def read_dataset(path: str) -> str:
-    """Read a CSV/TXT dataset and return summary statistics, reward distributions, and top-5 rows."""
+    """Summarize a campaign CSV/TXT file, including measured rewards and top points."""
     return _dispatch("read_dataset", {"path": path})
 
 @tool
 def analyze_space_coverage(db_path: str) -> str:
-    """PCA of observed concentration points. Returns coverage metrics and under-explored regions."""
+    """Report PCA coverage of observed concentration points."""
     return _dispatch("analyze_space_coverage", {"db_path": db_path})
 
 @tool
@@ -321,18 +298,13 @@ def estimate_roughness(db_path: str, n_select: int = 24, k: int = 5) -> str:
 
 @tool
 def check_suggestion_diversity(suggestions: list) -> str:
-    """Analyse diversity of a batch of suggested concentration points. Returns pairwise distances and verdict.
-    suggestions: list of dicts with keys MA, NaBrO3, H2SO4, Ru."""
+    """Report pairwise distances for proposed {MA, NaBrO3, H2SO4, Ru} concentrations."""
     return _dispatch("check_suggestion_diversity", {"suggestions": suggestions})
 
 @tool
 def override_bo_suggestions(working_db_path: str, original_rxn_ids: list,
                               override_rxn_ids: list, reason: str) -> str:
-    """Replace some BO-suggested candidates with agent-selected ones from unexplored regions.
-    original_rxn_ids: rxn_ids from BO suggestion.
-    override_rxn_ids: final rxn_ids to measure (subset of original + agent picks).
-    reason: your reasoning for the override (logged to WandB).
-    """
+    """Replace BO reaction IDs with override_rxn_ids and record the reason."""
     return _dispatch("override_bo_suggestions",
                      {"working_db_path": working_db_path,
                       "original_rxn_ids": original_rxn_ids,
@@ -343,12 +315,7 @@ def override_bo_suggestions(working_db_path: str, original_rxn_ids: list,
 def filter_suggestions(suggestions: list, reasoning: str,
                        keep_indices: list = None, reserves: list = None,
                        add_reserve_indices: list = None) -> str:
-    """Chemistry-aware filter over BO's suggested batch (use ONLY when the task says
-    filter_enabled=true). Review each suggestion's concentrations for chemical
-    soundness; keep the sound ones via keep_indices and optionally swap in reserves
-    via add_reserve_indices. This selects among already-computed candidates — it
-    does not re-run BO. suggestions/reserves: lists of {path, conc} from
-    run_bo_iteration. reasoning: your chemistry justification (logged to audit)."""
+    """Select BO/reserve indices only when filtering is enabled; include reasoning."""
     return _dispatch("filter_suggestions",
                      {"suggestions": suggestions, "reasoning": reasoning,
                       "keep_indices": keep_indices, "reserves": reserves,
@@ -357,11 +324,7 @@ def filter_suggestions(suggestions: list, reasoning: str,
 
 @tool
 def update_hypothesis(hypothesis: str, bo_iter: int = None) -> str:
-    """Write or revise your working hypothesis about WHERE the good BZ chemistry is
-    (use ONLY when the task says hypothesis_enabled=true). Allow MULTIPLE operating
-    windows — there may be more than one. Ground it in the literature corpus AND the
-    observed (concentration → reward) table in your context. It is persisted and shown
-    back to you every iteration, so revise it as data arrives rather than restating it."""
+    """When enabled, save a literature- and observation-grounded hypothesis for this iteration."""
     return _dispatch("update_hypothesis",
                      {"hypothesis": hypothesis, "bo_iter": bo_iter})
 
@@ -370,15 +333,7 @@ def update_hypothesis(hypothesis: str, bo_iter: int = None) -> str:
 def propose_experiments(explore_concentrations: list, keep_bo_indices: list = None,
                         suggestions: list = None, reserves: list = None,
                         reasoning: str = "") -> str:
-    """Set the final batch = kept BO picks + YOUR proposed points (use ONLY when the
-    task says inject_enabled=true). Use it to probe hypothesis windows BO is not
-    proposing.
-
-    explore_concentrations: [{"MA":_,"NaBrO3":_,"H2SO4":_}, ...] — each is snapped to
-      the nearest UNMEASURED pool candidate, so propose freely within the design space.
-    keep_bo_indices: indices of `suggestions` to KEEP alongside your points.
-    suggestions / reserves: the lists returned by run_bo_iteration.
-    reasoning: which hypothesis window each proposed point targets (logged to audit)."""
+    """When enabled, keep BO indices and snap {MA, NaBrO3, H2SO4, Ru} to unmeasured pool rows."""
     return _dispatch("propose_experiments",
                      {"explore_concentrations": explore_concentrations,
                       "keep_bo_indices": keep_bo_indices, "suggestions": suggestions,
@@ -388,8 +343,7 @@ def propose_experiments(explore_concentrations: list, keep_bo_indices: list = No
 @tool
 def generate_design_space(db_path: str, ranges: dict,
                            n_points: int = 10000, out_path: str = None) -> str:
-    """Generate candidates at an explicit out_path, excluding db_path measurements when provided.
-    ranges: {MA: {min, max, step}, NaBrO3: ..., H2SO4: ..., Ru: ...}"""
+    """Write out_path candidates from {reagent: {min, max, step}} ranges, excluding measured rows."""
     return _dispatch("generate_design_space",
                      {"db_path": db_path, "ranges": ranges, "n_points": n_points, "out_path": out_path})
 
@@ -400,12 +354,12 @@ def list_available_configs() -> str:
 
 @tool
 def prepare_bo_dataset(prepare_py: str = None) -> str:
-    """Use the campaign pool in place; optionally run a custom preparation script outside a campaign."""
+    """Use the campaign pool; custom preparation scripts apply only outside campaigns."""
     return _dispatch("prepare_bo_dataset", {"prepare_py": prepare_py} if prepare_py else {})
 
 @tool
 def run_bo_iteration(config: str, volume_uL: float) -> str:
-    """Run one BO iteration via suggest_next.py. Returns suggested protocol paths and concentrations."""
+    """Run fixed ALICE BO and return primary/reserve concentrations and protocol paths."""
     return _dispatch("run_bo_iteration", {"config": config, "volume_uL": volume_uL})
 
 @tool
@@ -417,24 +371,19 @@ def submit_protocol(proto_path: str) -> str:
 def wait_for_result(concs: list, db_path: str,
                     poll_s: float = 30.0, timeout_s: float = 14400.0,
                     qc_after_n: int = QC_AFTER_N_EXPERIMENTS, qc_volume_uL: float = 1900.0) -> str:
-    """Poll the experiments DB until ALL submitted experiments have a result row.
-    concs: list of {MA, NaBrO3, H2SO4, Ru} dicts.
-    qc_after_n: zero disables mid-batch QC; startup QC runs before each batch.
-    If QC fails, returns immediately with abort=True — the campaign must be aborted."""
+    """Collect pending results; qc_after_n=0 disables mid-batch QC, whose failure aborts collection."""
     return _dispatch("wait_for_result",
                      {"concs": concs, "db_path": db_path, "poll_s": poll_s,
                       "timeout_s": timeout_s, "qc_after_n": qc_after_n, "qc_volume_uL": qc_volume_uL})
 
 @tool
 def run_qc(volume_uL: float, db_path: str) -> str:
-    """Run the full QC cycle: submit QC experiments to robot and block until all results are in the DB.
-    Must be called before every BO iteration. Returns only when QC is complete."""
+    """Run QC before each batch; wait for all calibration results and report success or failure."""
     return _dispatch("run_qc", {"volume_uL": volume_uL, "db_path": db_path})
 
 @tool
 def get_current_pareto_front(db_path: str, skip_first_n: int = 0) -> str:
-    """Compute the current Pareto front (reward_oscillation vs reward_signal).
-    Use skip_first_n to exclude pre-campaign historical data."""
+    """Return the measured Pareto front; skip_first_n excludes initial historical rows."""
     return _dispatch("get_current_pareto_front", {"db_path": db_path, "skip_first_n": skip_first_n})
 
 @tool
@@ -445,7 +394,7 @@ def analyze_final_results(db_path: str, baseline_n_obs: int = 0) -> str:
 @tool
 def compare_initializers(db_path: str, n_init: int = 24, k: int = 5,
                           out_path: str = None) -> str:
-    """Compare Roughness vs Sobol GP seed selection. Returns overlap, roughness stats, H2SO4 distribution."""
+    """Compare Sobol and roughness seed selections on observed conditions."""
     return _dispatch("compare_initializers",
                      {"db_path": db_path, "n_init": n_init, "k": k, "out_path": out_path})
 

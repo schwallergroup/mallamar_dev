@@ -75,8 +75,7 @@ _experiment_mode = _default_prompts.experiment_mode
 _allowed_configs = _default_prompts.allowed_configs
 
 
-# Bound model context while retaining the complete checkpoint history.
-# Current progress and decision inputs are added again on each turn.
+# Limit model context while retaining full checkpoint history and refreshing current state.
 ORCH_CONTEXT_WINDOW = int(os.getenv("OCEAN_CONTEXT_WINDOW", "20"))
 
 
@@ -84,11 +83,10 @@ def _window_messages(msgs: list, keep: int = None):
     """Keep the task and recent messages without orphaning tool results."""
     keep = ORCH_CONTEXT_WINDOW if keep is None else keep
     if keep <= 0 or len(msgs) <= keep + 1:
-        return msgs, 0 # short campaign — unchanged from before
+        return msgs, 0
 
     start = len(msgs) - keep
-    # Advance past any leading tool results so every ToolMessage kept still has its
-    # parent AIMessage in the window.
+    # Keep each retained tool result with its parent model message.
     while start < len(msgs) and isinstance(msgs[start], ToolMessage):
         start += 1
     head = [msgs[0]] if start > 0 else []
@@ -137,10 +135,7 @@ def build_bo_decision_context(state: dict, campaign_prompts=None):
         f"  streak_of_current_acqf = {state.get('streak_of_current_acqf', 0)}",
         f"  bo_iter                = {state.get('bo_iter', 0)}",
     ]
-    # How `last_iter_improved` was decided. Under the 'pareto' signal it means "the
-    # last batch put >=1 point on the Pareto front" — NOT ">5% HV". Say so, because
-    # HV can fall while improving when rewards are recomputed each batch
-    # (OCEAN_REWARD_MODE=recompute refits the z-norm; see agent_lg/rewards.py).
+    # Pareto improvement means a new front member, even if recomputed hypervolume decreases.
     if signal == "pareto":
         lines += [
             f"  improvement_rule       = new Pareto point in batch "
@@ -158,18 +153,13 @@ def build_bo_decision_context(state: dict, campaign_prompts=None):
         lines += ['campaign_mode: bo; batch_size: 6; keep_bo_count: 6; llm_proposal_count: 0',
                   'SELECTION: return all six ALICE primaries in their original order; do not use hypothesis, filtering or injection.']
 
-    # hypothesisdriven mode (+ optional candidate injection)
-    # Ground the decision task in literature and observed experiment data.
-    # data on the first pass (write a hypothesis), then current hypothesis + fresh
-    # data every later pass (revise it). SOFT prioritisation only — the ablation
-    # showed soft beats hard veto (69.59 vs 69.13 HV).
+    # Ground hypothesis-driven selection in literature, observations and prior reasoning.
     _hyp_on = bool(os.getenv("OCEAN_BO_HYPOTHESIS")) or bool(os.getenv("OCEAN_BO_INJECT"))
     _inject_on = bool(os.getenv("OCEAN_BO_INJECT"))
     if _hyp_on:
         db = state.get("db_path", "") or os.getenv("OCEAN_CAMPAIGN_DB", "")
         current = _H.store().text
-        # Data grounding is load-bearing: without it the benchmark agent
-        # hallucinated off-pool chemistry (Mn(II), MeMA) and scored worst.
+        # Include measured outcomes to ground proposals in observed chemistry.
         obs = _H.observed_table(db) if db else "(no campaign db in state)"
         lines.append(f"hypothesis_enabled: true")
         lines.append(f"inject_enabled: {_flag(_inject_on)}")
@@ -186,7 +176,7 @@ def build_bo_decision_context(state: dict, campaign_prompts=None):
                 "STEP H: call update_hypothesis(hypothesis='...') with a concrete, "
                 "testable hypothesis about WHERE the good chemistry is. Allow MULTIPLE "
                 "operating windows — there may be more than one. Ground it in the "
-                "corpus AND the observed data above.",
+                "corpus AND the observed data above. Save the prior even at zero observations.",
             ]
         else:
             lines += [
@@ -204,8 +194,8 @@ def build_bo_decision_context(state: dict, campaign_prompts=None):
                 "contradicts. Cite specific measured points. CARRY FORWARD the windows "
                 "and contradicted regions you already established and ADD to them — a "
                 "shorter hypothesis that discards earlier evidence is a worse one. "
-                "Re-sending the text above unchanged is rejected: revise it, or skip "
-                "the call if the new data genuinely changes nothing.",
+                "Call update_hypothesis every iteration, including when the evidence "
+                "supports retaining the text unchanged.",
             ]
         if _inject_on:
             _n_agent = os.getenv("OCEAN_INJECT_N_AGENT", "3")
@@ -248,11 +238,7 @@ def make_agent_node(model, system_prompt: str, label: str = "agent", campaign_pr
         if ctx:
             extras.append(f"## Retrieved Literature\n{ctx}")
 
-        # `Target BO iters` gates the orchestrator's loop exit (prompts/orchestrator.md).
-        # It used to live only in the opening task string, so by iteration 12 the exit
-        # condition rested on the model recalling a number from turn 1. Rendered here it
-        # is restated every turn. Omitted when unset so a programmatic run_agent caller
-        # that never passes it sees the previous text.
+        # Restate the iteration budget each turn so the orchestrator can enforce completion.
         _target = state.get("target_bo_iters") or 0
         _target_line = f"Target BO iters: {_target}\n" if _target else ""
 
@@ -268,11 +254,7 @@ def make_agent_node(model, system_prompt: str, label: str = "agent", campaign_pr
                 f"{_target_line}"
                 f"Pareto HV history (updated automatically after each wait_for_result):\n{rows}"
             )
-            # Gated agent-BO decision context: only when an agentic axis is on, so
-            # These fields are precomputed in progress_tracker_node; the
-            # BO Specialist decision tables consume them instead of re-deriving
-            # streaks by eye. Only rendered here (orchestrator has the real
-            # CampaignState); the orchestrator relays them in the BO task.
+            # Pass measured progress and policy signals from the orchestrator to the BO specialist.
             if agentic_axes_on():
                 progress += (
                     f"\n\n### BO Decision Context (precomputed — use these exact values)\n"
@@ -288,11 +270,7 @@ def make_agent_node(model, system_prompt: str, label: str = "agent", campaign_pr
             extras.append(f"## Campaign Progress\nCurrent BO iter: {bo_iter} "
                           f"(no HV data yet)\n{_target_line}".rstrip())
 
-        # Bound what the ORCHESTRATOR sends to the model (see _window_messages). Subagents
-        # are invoked with a fresh single-message task and discarded, so they never
-        # accumulate and are left alone. state["messages"] is NOT modified: the
-        # checkpoint, the audit, auto_submitter's `state["messages"][-8:]` scan and
-        # progress_tracker_node's reverse scan all keep the complete history.
+        # Window orchestrator messages without changing checkpoint or audit history.
         history, n_elided = (_window_messages(state["messages"], keep=campaign_prompts.context_window)
                              if label == "Orchestrator" else (state["messages"], 0))
         if n_elided:
@@ -305,14 +283,7 @@ def make_agent_node(model, system_prompt: str, label: str = "agent", campaign_pr
                 f"where the campaign stands, and the messages below for what you are doing "
                 f"right now.")
 
-        sys_content = system_prompt + ("\n\n" + "\n\n".join(extras) if extras else "") # Append extras to system prompt so all agents have the same context info available at each turn
-        # The system prompt is identical every turn; dumping it is just noise.
-        # Print only the agent label as an "active turn" marker. Set OCEAN_DEBUG_PROMPTS=1
-        # to restore the full prompt dump when debugging prompt content.
-        # if os.getenv("OCEAN_DEBUG_PROMPTS") == "1":
-            # print(f"\n[{label}] System prompt:\n{sys_content[:1000]})§")
-        # else:
-            # print(f"\n[{label}]")
+        sys_content = system_prompt + ("\n\n" + "\n\n".join(extras) if extras else "") # Add current campaign context to the system prompt.
 
         if n_elided:
             print(f"[{label}] context window: sending {len(history)} of "
@@ -353,7 +324,9 @@ def _successful_tool_names(messages):
             payload = json.loads(msg.content)
         except (TypeError, json.JSONDecodeError):
             payload = None
-        if isinstance(payload, dict) and payload.get("error"):
+        if msg.name == "update_hypothesis" and (not isinstance(payload, dict) or payload.get("stored") is not True):
+            successful.discard(msg.name)
+        elif isinstance(payload, dict) and payload.get("error"):
             successful.discard(msg.name)
         else:
             successful.add(msg.name)
@@ -370,15 +343,26 @@ def build_subagent_graph(
     required_tool_guidance=None,
     max_required_nudges: int = 6,
     stop_after_required_tools: bool = False,
+    allowed_tools=None,
 ):
     """Build a simple agent+tools loop for a subagent (no checkpointing, no interrupt)."""
     agent_node = make_agent_node(model, system_prompt, label)
+    nudge_message = "Call the next available tool for your task. When your task is complete, return a final answer."
+    allowed_names = set(allowed_tools or ())
+    if allowed_tools is None:
+        for available_tool in ANALYZER_TOOLS + BO_TOOLS + [filter_suggestions, update_hypothesis, propose_experiments]:
+            allowed_names.add(available_tool.name)
+        allowed_names.update(tool_overrides or {})
 
     def tools_node(state: MessagesState): # This node is only called if the agent made at least one tool call in this turn
         last = state["messages"][-1] # The agent's most recent message, which contains the tool_calls
         results = []
         for tc in (getattr(last, "tool_calls", None) or []):
-            name, args, tid = tc["name"], tc.get("args", {}), tc.get("id", tc["name"]) 
+            name, args, tid = tc["name"], tc.get("args", {}), tc.get("id", tc["name"])
+            if name not in allowed_names:
+                results.append(ToolMessage(content=json.dumps({"error": f"{name} is not available to {label}"}),
+                                           tool_call_id=tid, name=name))
+                continue
             if name == "propose_experiments":
                 for message in reversed(state["messages"] + results):
                     if isinstance(message, ToolMessage) and message.name == "run_bo_iteration":
@@ -408,9 +392,9 @@ def build_subagent_graph(
             if tool_overrides and name in tool_overrides:
                 content = str(tool_overrides[name](args))
             else:
-                content = _dispatch(name, args) # Calls the actual tool function based on the name and args, returns the result as a string
+                content = _dispatch(name, args) # Dispatch the requested tool.
             print(f" → {content[:200]}")
-            results.append(ToolMessage(content=content, tool_call_id=tid, name=name)) # Convert the tool call result into a ToolMessage to be processed by the agent node on the next turn
+            results.append(ToolMessage(content=content, tool_call_id=tid, name=name)) # Return the tool result to the agent.
         return {"messages": results}
 
     def route(state: MessagesState):
@@ -421,14 +405,7 @@ def build_subagent_graph(
                 required = set(required or ())
                 seen = _successful_tool_names(state["messages"])
 
-                # Pool-mode completion is authoritative: it verifies a valid BO
-                # result, the requested injection split, and a stored hypothesis.
-                # A model may legitimately carry the previous hypothesis forward
-                # instead of calling update_hypothesis again in this iteration.
-                # Requiring every historical tool name here would let weaker local
-                # models loop forever on optional diversity calls after the batch is
-                # already final. 
-                # NOTE: Without a completion callback, retain the stricter transcript-based check.
+                # Use the completion callback when supplied; otherwise require successful tool calls.
 
                 workflow_complete = (
                     bool(completion_check(state))
@@ -450,7 +427,7 @@ def build_subagent_graph(
             if not (calls_present and calls_succeeded):
                 n_nudges = sum(
                     isinstance(msg, HumanMessage) and
-                    str(msg.content).startswith(NUDGE_MSG)
+                    str(msg.content).startswith(nudge_message)
                     for msg in msgs
                 )
                 if n_nudges >= max_required_nudges:
@@ -461,7 +438,7 @@ def build_subagent_graph(
         # A subagent should stop once it has used tools and returned a plain-text summary.
         if any(isinstance(msg, ToolMessage) for msg in msgs):
             return END
-        if len(msgs) >= 2 and isinstance(msgs[-2], HumanMessage) and msgs[-2].content == NUDGE_MSG:
+        if len(msgs) >= 2 and isinstance(msgs[-2], HumanMessage) and str(msgs[-2].content).startswith(nudge_message):
             return END
         return "nudge"
 
@@ -479,9 +456,9 @@ def build_subagent_graph(
             if guidance:
                 suffix += " " + guidance.strip()
         print(f"[{label}/WARN] Workflow incomplete — nudging.{suffix}")
-        return {"messages": [HumanMessage(content=NUDGE_MSG + suffix)]}
+        return {"messages": [HumanMessage(content=nudge_message + suffix)]}
 
-    g = StateGraph(MessagesState) # The state is just the conversation history (list of messages), which gets updated by the agent and tools nodes each turn
+    g = StateGraph(MessagesState) # Conversation messages form the subagent state.
     g.add_node("agent", agent_node)
     g.add_node("tools", tools_node)
     g.add_node("nudge", nudge_node)
@@ -505,14 +482,15 @@ def make_delegate_tools(base_model, context_store: dict, campaign_prompts=None):
     pure_bo = method is not None and method.n_agent == 0
     analyzer_tools = [tool for tool in ANALYZER_TOOLS
                       if not pure_bo or tool.name not in {'search_literature', 'search_chemrxiv'}]
-    analyzer_model = base_model.bind_tools(analyzer_tools) # The Analyzer needs access to all the analysis tools, but the BO Specialist only needs call_analyzer
-    analyzer_graph = build_subagent_graph(analyzer_model, campaign_prompts.analyzer, "Analyzer") # The Analyzer agent can analyze the campaign state and answer questions about it, but it doesn't make BO decisions
+    analyzer_model = base_model.bind_tools(analyzer_tools) # Bind the Analyzer's permitted tools.
+    analyzer_names = []
+    for available_tool in analyzer_tools:
+        analyzer_names.append(available_tool.name)
+    analyzer_graph = build_subagent_graph(analyzer_model, campaign_prompts.analyzer, "Analyzer",
+                                         allowed_tools=analyzer_names)
     @tool
     def call_analyzer(task: str) -> str:
-        """Delegate a data-analysis or reporting task to the Analyzer agent.
-        It has access to: search_literature, read_dataset, analyze_space_coverage,
-        get_current_pareto_front, analyze_final_results, write_report.
-        Describe the full task in the `task` string including relevant file paths."""
+        """Delegate analysis or reporting; include the dataset path and task."""
         result = analyzer_graph.invoke({"messages": [HumanMessage(content=_with_context(task))]})
         last = result["messages"][-1]
         return last.content if isinstance(last.content, str) else json.dumps(last.content)
@@ -535,24 +513,19 @@ def make_delegate_tools(base_model, context_store: dict, campaign_prompts=None):
             "received_args": args,
         })
 
-    # Bound specialist model retries when agent features are enabled.
-    # Robot heartbeat waits remain independent of the LLM timeout.
+    # Bound specialist LLM calls independently of robot heartbeat waits.
     bo_base = base_model
     if agentic_axes_on() and base_model.__class__.__name__ == "ChatOpenAI":
-        try:
-            _to = float(os.getenv("OCEAN_BO_LLM_TIMEOUT", "120"))
-            _rt = int(os.getenv("OCEAN_BO_LLM_RETRIES", "1"))
-            bo_base = ChatOpenAI(
-                model=base_model.model_name,
-                base_url=base_model.openai_api_base,
-                api_key=base_model.openai_api_key,
-                timeout=_to, max_retries=_rt,
-                max_tokens=getattr(base_model, "max_tokens", 4096),
-            )
-            print(f"[BO-Specialist] fast LLM client: timeout={_to}s, max_retries={_rt}")
-        except Exception as e:
-            print(f"[BO-Specialist] could not build fast client ({e}); using base model.")
-            bo_base = base_model
+        timeout = float(os.getenv("OCEAN_BO_LLM_TIMEOUT", "120"))
+        retries = int(os.getenv("OCEAN_BO_LLM_RETRIES", "1"))
+        bo_base = ChatOpenAI(
+            model=base_model.model_name,
+            base_url=base_model.openai_api_base,
+            api_key=base_model.openai_api_key,
+            timeout=timeout, max_retries=retries,
+            max_tokens=getattr(base_model, "max_tokens", 4096),
+        )
+        print(f"[BO-Specialist] fast LLM client: timeout={timeout}s, max_retries={retries}")
     # Pure BO exposes only the tools needed to prepare and check ALICE's batch.
     _bo_tools = [tool for tool in BO_TOOLS if not pure_bo or tool.name in {
         'list_available_configs', 'prepare_bo_dataset', 'run_bo_iteration',
@@ -565,33 +538,45 @@ def make_delegate_tools(base_model, context_store: dict, campaign_prompts=None):
         _bo_tools.append(update_hypothesis)
     if os.getenv("OCEAN_BO_INJECT"):
         _bo_tools.append(propose_experiments)
-    bo_model = bo_base.bind_tools(_bo_tools) # The BO Specialist needs access to the BO tools plus call_analyzer so it can query the Analyzer for insights before making decisions
+    bo_model = bo_base.bind_tools(_bo_tools) # Bind BO tools and Analyzer delegation.
     def required_bo_tools(state):
         method = CampaignMethod.from_environment()
         if method is None:
             return None
-        return {'run_bo_iteration', 'propose_experiments'} if method.n_agent else {'run_bo_iteration'}
+        if method.n_agent:
+            return {'update_hypothesis', 'run_bo_iteration', 'propose_experiments'}
+        return {'run_bo_iteration'}
 
+    def hypothesis_saved(state):
+        method = CampaignMethod.from_environment()
+        if method is None or not method.n_agent:
+            return True
+        history = _H.store().history
+        return (bool(history) and history[-1].get('bo_iter') == int(os.getenv('OCEAN_BO_ITER', '0'))
+                and 'update_hypothesis' in _successful_tool_names(state['messages']))
+
+    bo_names = []
+    for available_tool in _bo_tools:
+        bo_names.append(available_tool.name)
     bo_graph = build_subagent_graph(
-        bo_model, campaign_prompts.bo, "BO-Specialist",
+        bo_model, campaign_prompts.bo, "BO-Specialist", allowed_tools=bo_names,
         tool_overrides={"call_analyzer": _call_analyzer_or_recover},
         required_tools=required_bo_tools,
-        required_tool_guidance="Complete the tools required by the configured mode. Pure BO retains all six primaries; injection modes require successful propose_experiments.",
+        completion_check=hypothesis_saved,
+        required_tool_guidance="Pure BO retains all six primaries. LLM modes must save a hypothesis for this iteration (unchanged text is allowed) and successfully propose_experiments.",
     )
 
     @tool
     def call_bo_specialist(task: str) -> str:
-        """Delegate a BO decision task to the BO Specialist agent.
-        It queries the Analyzer, then runs the fixed T5Gemma / qLogNParEGO configuration.
-        Provide db_path, volume_uL, current BO iteration index, and n_observed."""
+        """Delegate batch selection with the pool path, volume, iteration and observation count."""
         _t0 = time.time()
-        result = bo_graph.invoke({"messages": [HumanMessage(content=_with_context(task))]}) # The BO Specialist subgraph is invoked with the task description, which may include references to the current campaign state and a request for a BO recommendation. The subgraph processes the task using the BO Specialist agent and any necessary tool calls (including call_analyzer if it needs insights from the Analyzer), and produces a final response.
+        result = bo_graph.invoke({"messages": [HumanMessage(content=_with_context(task))]}) # Run the specialist workflow for this task.
+        if not hypothesis_saved(result):
+            return json.dumps({'error': '[hypothesis] Save a hypothesis for the current iteration before accepting a batch', 'abort': True})
         _wall_s = round(time.time() - _t0, 2)
         last = result["messages"][-1]
 
-        # Per-decision agentic metrics (cost + reliability + faithfulness) for the
-        # paper pipeline. Cheap to compute; surfaced in the structured result and
-        # persisted to the audit log by progress_tracker_node when OCEAN_BO_MODE set.
+        # Collect per-decision usage and reliability metrics for the campaign audit.
         _msgs = result["messages"]
         n_tool_calls = sum(1 for m in _msgs if isinstance(m, ToolMessage))
         n_llm_calls = sum(1 for m in _msgs if isinstance(m, AIMessage))
@@ -626,9 +611,7 @@ def make_delegate_tools(base_model, context_store: dict, campaign_prompts=None):
         if run_payload.get('error') or run_payload.get('abort') or run_payload.get('returncode') not in (None, 0):
             return json.dumps({'error': run_payload.get('error') or run_payload.get('stderr') or '[method] BO worker failed', 'abort': True})
         if run_payload:
-            # Batch precedence: injection (BO picks + agent-proposed) beats the
-            # chemistry filter (selection among BO's own candidates), which beats
-            # BO's raw batch. Injection is the later, more specific decision.
+            # Prefer injected candidates, then filtered candidates, then the original BO batch.
             suggestions = (inject_payload.get("suggestions")
                            or filter_payload.get("suggestions")
                            or run_payload.get("suggestions")

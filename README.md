@@ -49,7 +49,7 @@ pip install .
 Both installation routes use [`requirements.txt`](requirements.txt). ALICE is
 bundled in `vendor/alice`; a separate ALICE installation is unnecessary.
 GPU execution needs a compatible NVIDIA driver and PyTorch installation.
-For offline campaigns, cache the T5Gemma model before starting.
+For runs without internet access, cache the T5Gemma model before starting.
 
 ## Prepare a campaign
 
@@ -125,9 +125,9 @@ LLM-selected points, use `--campaign-mode llm` and keep the local paper director
 The default backend is Anthropic. To use it, set `ANTHROPIC_API_KEY` and omit the
 Ollama backend, model, URL and API-key arguments.
 
-The agent workflow requests QC before each batch; QC is separate from the six
-optimization experiments. **QC is currently enforced by the agent instructions,
-not a submission guard.** Submission requests operator approval by default.
+Successful QC is required before submitting each new campaign batch; QC is
+separate from the six optimization experiments. Restarts reuse completed QC.
+Submission requests operator approval by default.
 QC concentrations and durations are defined in [`config.py`](agent_lg/config.py).
 
 Choose reward normalization explicitly for a live campaign:
@@ -137,6 +137,51 @@ Choose reward normalization explicitly for a live campaign:
 | `recompute` | Refit normalization over observed measurements after each batch. |
 | `freeze` | Fit normalization on the first batch and reuse it. Embedding training stays enabled. |
 | `off` — default | Leave supplied rewards unchanged. |
+
+Normalization uses successful measurements only and needs at least two successes.
+If it cannot be fitted, the campaign pauses with its measurements preserved; it
+never saves NaN constants. Provide sufficient initial measurements or a valid
+`reward_norm.json` for `freeze` mode before restarting an underdetermined run.
+
+## Replay a measured dataset without a robot
+
+Use `--dry-run --replay-data` to run the same campaign graph against recorded BZ
+measurements. No mailbox or hardware listener is needed. Sobol initialization
+uses concentrations; subsequent BO uses the existing ALICE `MultiDeepGP`,
+trainable T5Gemma embeddings and fixed qLogNParEGO. The reasoning model and T5Gemma
+are still required.
+
+```bash
+mallamar --dry-run --replay-data /path/to/measured_grid.csv \
+  --db runs/demo/pool.csv --checkpoint-db runs/demo/checkpoints.sqlite \
+  --campaign-mode bo-llm --papers references/papers \
+  --reward-mode recompute --n_bo_iters 4 --thread-id replay-demo \
+  --backend openai --model qwen2.5:14b \
+  --base-url http://localhost:11434/v1 --api-key ollama --auto-approve
+```
+
+The source CSV must contain one measurement per distinct composition, with the
+four `conc_*` columns listed above and these robot-result columns:
+`interp_period_mean_s`, `interp_period_std_s`, `interp_maxima_mean_V`,
+`interp_maxima_std_V`, `interp_amplitude_mean_V`, `interp_amplitude_std_V`,
+`total_time_s` and `n_osc`. Include failed experiments with `n_osc=0`;
+undefined oscillation descriptors may be empty for those rows. If provided,
+`failure_mode` is preserved when that experiment is revealed. The public 10k
+candidate template has no measurements and cannot serve as a replay source.
+
+The source remains unchanged. A new working pool is built using the shared BZ
+concentration-to-text template, with all outcomes hidden initially. Only selected
+measurements are revealed through normal result collection and reward scoring.
+Replay supports `recompute` and `freeze`; stored source rewards are ignored.
+Without an explicit reward mode, the CLI selects `recompute` for dataset replay.
+QC is explicitly simulated and does not assess hardware or chemistry. Use `bo`
+for six BO points or `llm` for six LLM points, as for hardware campaigns.
+
+Start in a fresh workspace; existing pools are never overwritten. Resume with
+`mallamar --resume --thread-id replay-demo --checkpoint-db runs/demo/checkpoints.sqlite`.
+Keep the source unchanged: its identity is checked on restart. Actual LLM outputs
+can vary with model revisions and generation settings. `--dry-run` without
+`--replay-data` retains the limited result-waiting mock, rather than dataset replay.
 
 ## Inspect and resume
 
@@ -168,6 +213,78 @@ thread = run_agent(
 resume_agent(thread, checkpoint_db="checkpoints.sqlite")
 ```
 
+## Adapt Mallamar to another reaction
+
+The supplied workflow is BZ-specific. Another reaction requires Python changes
+as well as a new dataset; renaming a CSV or editing the YAML alone is not enough.
+Reuse ALICE, the agent graph, checkpointing and recovery. For a first adaptation,
+keep numeric candidate variables, two maximized objectives and six experiments
+per batch. Categorical variables or a different objective count need additional
+changes and validation.
+
+1. **Define the candidate pool and units.** List the conditions users can vary,
+   their allowed values and units. Create one row per distinct candidate, with a
+   consistent `prompt`, empty `exp_id` and empty rewards for unattempted rows.
+   Replace the BZ column names in both [`config.py`](agent_lg/config.py) and
+   [`rewards.py`](agent_lg/rewards.py). Set matching tolerances and rounding
+   precision to suit the instrument and design-space resolution.
+
+2. **Update condition validation and suggestion formatting.** Replace reagent
+   aliases and BZ concentration requirements in
+   [`protocols.py`](agent_lg/services/protocols.py). Update the explicit reagent
+   mappings in [`tools/bo.py`](agent_lg/tools/bo.py) and
+   [`suggestions.py`](agent_lg/services/suggestions.py), including cold-start
+   output and final-batch matching. Keep the existing condition-based Sobol and
+   nearest-candidate algorithms; supply the new variables in a consistent order.
+   Check result matching in [`results.py`](agent_lg/services/results.py).
+
+3. **Define measurements, objectives and failures.** In
+   [`rewards.py`](agent_lg/rewards.py), replace the raw metric columns, derived
+   quantities, coefficients and BZ-specific failure rule (`n_osc == 0`). Specify
+   which outcomes count as chemical failures and which are instrument failures.
+   Choose normalization explicitly. Update target names in the existing
+   [`t5gemma_s_joint.yaml`](agent_lg/configs/t5gemma_s_joint.yaml), keeping them
+   consistent across `REWARD_COLS`, BO and result-collection tools,
+   [`pool checks`](agent_lg/services/pools.py), [`status`](agent_lg/services/status.py)
+   and [`analysis tools`](agent_lg/tools/analysis.py). Set `REF_POINT` in
+   `config.py` to suit the new objective scales for reported hypervolume.
+   Search `agent_lg/` for the old column names and `n_osc` to catch remaining
+   BZ-specific readers. The T5Gemma model, embedding fine-tuning and qLogNParEGO
+   implementation can remain unchanged.
+
+4. **Describe the new chemistry to T5Gemma and the agents.** Replace
+   `reaction_prompt()` in [`protocols.py`](agent_lg/services/protocols.py) and
+   regenerate candidate descriptions before starting a campaign. Replace the BZ
+   scientific context and examples in [`prompts/`](agent_lg/prompts), especially
+   `bz_context.md`, and supply relevant local papers for LLM-assisted modes.
+   Update the campaign task text in [`cli.py`](agent_lg/cli.py), BZ examples in
+   [`agents.py`](agent_lg/agents.py), observation labels in
+   [`hypothesis.py`](agent_lg/tools/hypothesis.py) and
+   [`tool descriptions`](agent_lg/tools_registry.py). State the actual variables,
+   units and objectives so agent proposals match the dataset.
+
+5. **Adapt result collection for the execution mode.** Update the result-field
+   mappings, summaries and failure records in [`tools/robot.py`](agent_lg/tools/robot.py).
+   For offline replay, also replace the BZ raw-metric checks in
+   [`ReplayController`](agent_lg/services/replay.py); it must reveal only selected
+   measurements and use the same scoring as a live campaign. For hardware runs,
+   update QC settings in [`config.py`](agent_lg/config.py), the experiment payload
+   in [`io_mailbox.py`](agent_lg/scripts/io_mailbox.py) and the external hardware
+   listener to execute the new reaction and return the agreed measurement schema.
+
+6. **Validate with measured data before hardware.** Use the replay command above
+   with a small measured dataset and enough candidates for at least two batches.
+   Start with `bo`, then test `bo-llm` and `llm` in separate fresh workspaces with
+   the new papers. Check known reward calculations, seeded Sobol conditions,
+   variable units, candidate matching, successful and failed measurements, saved
+   hypotheses, and crash/resume without selecting attempted rows again. Confirm
+   unselected outcomes stay hidden. Validate the hardware listener and QC
+   separately before starting physical experiments.
+
+Start a new campaign after adapting the reaction. Existing campaigns verify
+recorded configurations, prompts and candidate identities on resume; do not
+reuse a BZ checkpoint with a changed reaction definition.
+
 ## Reproducibility and license
 
 Numerical reproduction depends on the dependency versions, model revisions,
@@ -176,4 +293,4 @@ versions; it is not a complete historical environment lock.
 
 Mallamar is licensed under [Apache-2.0](LICENSE). Bundled ALICE and upstream
 attributions are retained in [NOTICE](NOTICE) and
-[`vendor/alice/LICENSE`](vendor/alice/LICENSE).
+[`vendor/alice/LICENSE-ALICE`](vendor/alice/LICENSE-ALICE).

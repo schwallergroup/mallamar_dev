@@ -6,23 +6,88 @@ __pycache__/
 .Python
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 .ipynb_checkpoints/
 
 ### Virtualenvs / editor settings ###
 .venv/
 venv/
 .env
+.env.*
+!.env.example
+!.env.template
 .claude/
 .vscode/
 .idea/
 
-### Run artifacts ###
+### Campaign outputs and diagnostics (at any depth) ###
 wandb/
+logs/
+results*/
+reports/
+runs/
+outputs/
+checkpoints/
+mailbox/
+*.log
+*.log.*
+logs_*.txt
+*.jsonl
+*.jsonl.*
+*.out
+*.err
+
+### Checkpoints, temporary files and backups ###
 *.sqlite
-*.sqlite-shm
-*.sqlite-wal
-agent_checkpoints.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
 *.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+### Local measurements and saved model artifacts ###
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+pytorch_model*.bin
+adapter_model*.bin
+
+### Standalone campaign state and mailbox files ###
+experiments_db*.txt
+reward_norm*.json
+hypothesis*.json
+suggestions*.json
+qc_protocol*.json
+campaign_report*.md
+optimizer_seq.txt
+optimizer_seq.lock
+optimizer_to_hw.txt
+optimizer_to_hw.lock
+hw_to_optimizer.txt
+hw_to_optimizer.lock
 
 ### Machine-specific output symlinks (point at /scratch — never commit) ###
 /logs
@@ -44,9 +109,6 @@ final_results_report.md
 report.md
 results.md
 **datasets/*.csv
-
-### Old results directories ###
-results_MOBBOL/
 
 ### Per-study output (under studies/<name>/results/) ###
 studies/*/results/
@@ -71,7 +133,7 @@ final_campaign_results*.md
 analysis/
 
 # write_report resolves a RELATIVE out_path against the repo root, and the agent has
-# passed "scratch/dsegura/..." (no leading slash) intending the real /scratch. That
+# passed "scratch/user/..." (no leading slash) intending the real /scratch. That
 # creates a scratch/ tree inside the working copy full of campaign reports.
 scratch/
 
@@ -86,7 +148,9 @@ agent_lg/scripts/analyze_campaign_pool.py
 agent_lg/scripts/suggest_final_batch.py
 
 ### HPC-specific job scripts ###
-/slurm/
+slurm/
+*.slurm
+*.sbatch
 
 ### Scratch / run artifacts ###
 repro_test_*.out
@@ -116,21 +180,22 @@ mock_*.py
 !/agent_lg/configs/t5gemma_s_joint.yaml
 
 # Local cleaning progress
-/CLEANING_PROGRESS.md
+CLEANING_PROGRESS.md
 
 # Linux reproduction environment snapshots
-/environment-reproduction-linux*.yaml
-/environment-reproduction-linux*.yml
-/requirements-reproduction-linux*.txt
+environment-reproduction-linux*.yaml
+environment-reproduction-linux*.yml
+requirements-reproduction-linux*.txt
 
 # Campaign recovery records and writer locks
 **/.mallamar/
 *.mallamar.lock
 
 # Generated distribution artifacts
-/build/
-/dist/
-/logs/
+build/
+dist/
+*.whl
+*.egg
 
 agent_lg/scripts/check_environment.py
 

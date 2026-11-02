@@ -108,8 +108,7 @@ def route_after_agent(state):
         return "tools"
     msgs = state["messages"]
     if len(msgs) >= 2 and isinstance(msgs[-2], HumanMessage) and msgs[-2].content == NUDGE_MSG:
-        # Normally one failed nudge ends the run. But ending while iterations remain
-        # discards budget silently, so keep nudging (bounded) until the campaign is done.
+        # Retry silent turns while budget remains, up to the configured nudge limit.
         done, target = _campaign_progress(state)
         if target and done < target and _trailing_nudges(msgs) < MAX_NUDGES_WHILE_INCOMPLETE:
             print(f"[WARN] No tool calls, but only {done}/{target} BO iterations are done "
@@ -128,17 +127,14 @@ def route_after_progress_tracker(state: CampaignState):
     """End if finish_campaign was called, otherwise loop back to agent."""
     for msg in reversed(state["messages"]):
         if isinstance(msg, ToolMessage) and msg.name == "finish_campaign":
+            result = require_tool_success("finish_campaign", msg.content)
             done, target = _campaign_progress(state)
             if target and done < target:
-                already_corrected = any(
-                    isinstance(m, HumanMessage) and m.content.startswith("STOP — you called")
-                    for m in state["messages"])
-                if not already_corrected:
-                    print(f"[WARN] finish_campaign called at {done}/{target} BO iterations "
-                          f"— sending the real counts back and continuing.")
-                    return "correct_early_finish"
-                print(f"[ERROR] finish_campaign at {done}/{target} iterations, after a "
-                      f"correction. Honouring it; {target - done} iteration(s) unused.")
+                print(f"[WARN] finish_campaign called at {done}/{target} BO iterations "
+                      f"— sending the real counts back and continuing.")
+                return "correct_early_finish"
+            if result.get("status") == "incomplete":
+                return "agent" # a blocked finish is not completed cleanup
             return END
         if isinstance(msg, AIMessage):
             break
@@ -200,9 +196,7 @@ def progress_tracker_node(state: CampaignState):
 
     prev_hv = history[-1].get("hv_2d") if history else None # HV before this iter
 
-    # exp_ids measured in THIS iteration (from wait_for_result's `found` list) and
-    # cumulatively by this campaign — used for the Pareto-membership improvement
-    # signal and campaign-scoped HV respectively.
+    # Track batch and campaign experiment IDs for Pareto membership and campaign hypervolume.
     batch_ids = [str(f.get("exp_id")) for f in (wait_result.get("found") or [])
                  if isinstance(f, dict) and f.get("exp_id")]
     campaign_ids = list(dict.fromkeys(list(state.get("campaign_exp_ids") or []) + batch_ids))
@@ -216,13 +210,11 @@ def progress_tracker_node(state: CampaignState):
     else:
         hv_info.update({"n_observed": 0, "n_pareto": 0, "hv_2d": 0.0})
 
-    # `pareto_exp_ids` is provenance, not progress — keep it out of the history the
-    # Orchestrator reads (it would grow the prompt every iter for no benefit).
+    # Keep Pareto point IDs out of the growing model-facing progress history.
     front_ids = hv_info.pop("pareto_exp_ids", None)
     history.append(hv_info)
 
-    # Agent-BO decision state: did this iteration improve, and what's the stall
-    # streak? Pure arithmetic on the HV history / front membership 
+    # Update improvement and stall counters from the selected signal.
 
     improve_signal = resolve_improve_signal()
     if improve_signal == "pareto" and hv_info.get("n_new_pareto") is not None:
@@ -290,8 +282,7 @@ def progress_tracker_node(state: CampaignState):
     if agentic_axes_on() and db:
         oracle_acqf = "parego" if acqf_now else None
         policy_violation = False if acqf_now else None
-        # decision_source: a run_bo_iteration ToolMessage at the orchestrator
-        # level (before the last call_bo_specialist) means the fallback fired.
+        # A direct BO tool result identifies fallback selection at the orchestrator level.
         decision_source = "agent"
         for msg in reversed(msgs):
             if isinstance(msg, ToolMessage) and msg.name == "call_bo_specialist":
@@ -306,13 +297,11 @@ def progress_tracker_node(state: CampaignState):
             #  performance
             "n_observed": hv_info.get("n_observed"), "n_pareto": hv_info.get("n_pareto"),
             "hv_2d": hv_info.get("hv_2d"),
-            # Campaign-scoped HV (excludes pre-campaign rows in the pool) + the
-            # improvement signal that actually drove this iter's decision.
+            # Report hypervolume and improvement using only this campaign's measured points.
             "hv_campaign": hv_info.get("hv_campaign"),
             "n_observed_campaign": hv_info.get("n_observed_campaign"),
             "n_new_pareto": hv_info.get("n_new_pareto"),
-            # The rule that actually decided `improved`; `improve_signal_requested`
-            # differs from it only when the pareto signal was unavailable.
+            # Record the improvement rule actually used when Pareto membership is unavailable.
             "improve_signal": signal_used,
             "improve_signal_requested": improve_signal,
             "batch_exp_ids": batch_ids,
@@ -330,10 +319,7 @@ def progress_tracker_node(state: CampaignState):
             "total_tokens": bo_payload.get("total_tokens"),
             "filter_overrode_bo": bo_payload.get("filter_overrode_bo"),
             "reasoning": bo_payload.get("reasoning"),
-            #  hypothesis + injection axes
-            # inject_points carries the requested conc, the snapped pool conc and the
-            # snap distance. The benchmark omitted this, making injected BZ points
-            # unrecoverable after the fact; don't repeat that.
+            # Record requested and matched concentrations with their normalized matching distances.
             "hypothesis": bo_payload.get("hypothesis"),
             "n_agent_injected": bo_payload.get("n_agent_injected"),
             "inject_points": bo_payload.get("inject_points"),
@@ -407,9 +393,16 @@ def _bo_fallback(state: "CampaignState", bo_mode: str, tool_id: str):
     }
 
 
-def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, campaign_prompts=None, context_store=None):
+def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, campaign_prompts=None, context_store=None,
+                    allowed_tools=None):
     """Returns the `tools` node for the Orchestrator."""
     _delegates = delegate_tool_map or {}
+    allowed_names = set(allowed_tools or ())
+    if allowed_tools is None:
+        allowed_names.update(_delegates)
+        allowed_names.add('run_bo_iteration')
+        for available_tool in ORCHESTRATOR_DIRECT_TOOLS:
+            allowed_names.add(available_tool.name)
 
     def tools(state: CampaignState):
         if context_store is not None:
@@ -424,11 +417,16 @@ def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, 
         pending_json_path = state.get("pending_json_path", "")
         pending_concs = list(state.get("pending_concs", []))
         state_updates = {}
+        collected_batch = False
 
         for tc in tool_calls:
             name = tc["name"]
             args = dict(tc.get("args", {}))
             tool_id = tc.get("id", f"tc_{name}")
+            if name not in allowed_names:
+                results.append(ToolMessage(content=json.dumps({"error": f"{name} is not available to the Orchestrator"}),
+                                           tool_call_id=tool_id, name=name))
+                continue
 
             if name in ("call_bo_specialist", "finish_campaign") and pending_concs:
                 raise CampaignSafetyError(f"[{name}] Pending batch must be collected before proposing or finishing")
@@ -488,17 +486,22 @@ def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, 
                         tool_call_id=tool_id,
                         name=name,
                     ))
-                    # Drop the batch. Leaving it pending let a later wait_for_result
-                    # (or auto_submitter) poll for experiments that were never sent —
-                    # the campaign then hangs for the full 4 h timeout_s.
+                    # Clear rejected batches so collection cannot wait for experiments that were never submitted.
                     pending_json_path = ""
                     pending_concs = []
                     state_updates["pending_json_path"] = ""
                     state_updates["pending_concs"] = []
                     continue
 
-            # Inject db_path for finish_campaign to enable fallback report generation
+            # Check the budget before cleanup or a completion record can be written.
             if name == "finish_campaign":
+                done, target = _campaign_progress(state)
+                done += int(collected_batch)
+                if target and done < target:
+                    results.append(ToolMessage(content=json.dumps({"status": "incomplete", "done": done,
+                                               "target": target, "message": "Collect the remaining batches before finishing."}),
+                                               tool_call_id=tool_id, name=name))
+                    continue
                 args["db_path"] = state.get("db_path", "")
                 args["_campaign_id"] = state.get("campaign_id") or str(Path(args["db_path"]).resolve())
 
@@ -510,12 +513,13 @@ def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, 
             if name in ("submit_protocol", "wait_for_result", "run_qc", "finish_campaign"):
                 outcome = require_tool_success(name, content)
                 if name == "wait_for_result":
-                    state_updates["collected_batch_id"] = outcome.pop("batch_id", "")
+                    batch_id = outcome.pop("batch_id", "")
+                    state_updates["collected_batch_id"] = batch_id
+                    collected_batch = not batch_id or batch_id != state.get("last_committed_batch")
                     content = json.dumps(outcome) # internal recovery IDs stay out of the model's context
                     pending_json_path, pending_concs = "", []
                     state_updates.update(pending_json_path="", pending_concs=[])
-            # delegate tools (call_analyzer / call_bo_specialist) print their own
-            # response inside the sub-agent; don't echo the same text again here.
+            # Delegates print their own responses, so avoid echoing them again.
             if name not in _delegates:
                 print(f"       → {content[:300]}")
             results.append(ToolMessage(content=content, tool_call_id=tool_id, name=name))
@@ -540,14 +544,7 @@ def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, 
                     state_updates["pending_json_path"] = pending_json_path
                     state_updates["pending_concs"] = pending_concs
 
-                    # Write-back (gated on "any axis is on"): the batch the agent
-                    # actually chose is what gets submitted. Without this the robot
-                    # runs BO's original batch while wait_for_result polls for the
-                    # agent's — see tools/bo.py::write_final_batch. MUST NOT be gated
-                    # on OCEAN_BO_MODE: the filter and injection axes change the batch
-                    # under their own env vars, so keying write-back to the acqf mode
-                    # left `OCEAN_BO_INJECT=1` alone re-opening that 4 h phantom poll.
-                    # Falls back to BO's JSON on any problem, so the loop can't break here.
+                    # Write the final selection so execution and result matching use the same batch.
                     if agentic_axes_on() and pending_json_path and pending_concs:
                         _final = write_final_batch(pending_json_path, pending_concs)
                         if _final:
@@ -556,11 +553,7 @@ def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, 
                         else:
                             if method:
                                 raise CampaignSafetyError('[method] Could not save the selected batch; no substitute BO batch was submitted')
-                            # Write-back refused, so the robot will be sent BO's ORIGINAL
-                            # json. The polled concentrations must follow it, or we are
-                            # back to blocker #1: robot runs one batch, wait_for_result
-                            # polls for another, 4 h timeout. Losing the agent's selection
-                            # for one iteration is the cheap failure; a mismatch is not.
+                            # Use original BO concentrations only when legacy write-back is unavailable.
                             _bo_concs = None
                             try:
                                 _orig = _json.loads(Path(pending_json_path).read_text())
@@ -597,6 +590,7 @@ def make_tools_node(auto_approve: bool = False, delegate_tool_map: dict = None, 
                 except Exception:
                     summary = ""
                 print(f"\n{'='*60}\n[DONE] Campaign finished.\n{summary}\n{'='*60}")
+                break
 
         return {"messages": results, **state_updates}
     return tools
@@ -634,8 +628,12 @@ def build_graph(base_model, auto_approve: bool = False, checkpointer=None):
 
     orch_node = make_agent_node(orchestrator_model, campaign_prompts.orchestrator, "Orchestrator",
                                 campaign_prompts=campaign_prompts)
+    orchestrator_names = []
+    for available_tool in orch_tools:
+        orchestrator_names.append(available_tool.name)
     tools_node = make_tools_node(auto_approve=auto_approve, delegate_tool_map=delegate_tool_map,
-                                 campaign_prompts=campaign_prompts, context_store=context_store)
+                                 campaign_prompts=campaign_prompts, context_store=context_store,
+                                 allowed_tools=orchestrator_names)
 
     def auto_submitter_node(state: CampaignState):
         """Submit the pending batch when the specialist has only suggested it."""
@@ -646,13 +644,9 @@ def build_graph(base_model, auto_approve: bool = False, checkpointer=None):
         if not (pending_json and pending_concs_s and db_path):
             return {}
 
-        # Did the LLM itself submit/wait? Look at recent tool messages.
+        # Check whether the model already submitted or collected this batch.
 
-        # A submit_protocol that was REJECTED (or that lost the robot heartbeat) is NOT
-        # a submission. Keying off the tool NAME alone meant a rejected attempt marked
-        # the batch as "already submitted", so this node skipped submitting and injected
-        # wait_for_result anyway — polling for six experiments that were never sent,
-        # for the full 4 h timeout. Caught by the reject-first loopback test.
+        # Treat only successful submission results as evidence that a batch was sent.
         def _submission_succeeded(message):
             result = require_tool_success("submit_protocol", message.content)
             return result.get("status") == "ok"
@@ -674,9 +668,7 @@ def build_graph(base_model, auto_approve: bool = False, checkpointer=None):
 
         msgs = []
         collected_batch_id = state.get("collected_batch_id", "")
-        # submit_protocol — only if LLM didn't already do it.
-        # Route through the SAME human-approval gate as the tools node so this
-        # auto-injected path can no longer bypass sign-off (it previously did).
+        # Use the same approval gate for automatic and explicit submissions.
         if not already_submitted:
             if not auto_approve and not _request_human_approval(pending_json):
                 print("[auto_submitter] Submission rejected by human.")
@@ -695,9 +687,9 @@ def build_graph(base_model, auto_approve: bool = False, checkpointer=None):
                                     tool_call_id="auto_submit",
                                     name="submit_protocol"))
 
-        # wait_for_result — always chain if not yet done (this is the common LLM skip)
+        # Collect pending results when the model omits the wait call.
         if not already_waited:
-            # Normalize gollum's {"path": ..., "conc": {"MA": ...}} format to flat conc dicts.
+            # Flatten nested BO concentrations for result matching.
             normalized_concs = []
             for s in pending_concs_s:
                 if isinstance(s, dict) and isinstance(s.get("conc"), dict):

@@ -34,12 +34,9 @@ class SurrogateModel(ABC):
         pass
 
 class MultiGP(SurrogateModel):
-    """
-    Static Gaussian Process model optimized for fixed descriptor.
-
-    Adapted from doi.org/10.1021/jacs.2c08592 and github.com/doyle-lab-ucla/edboplus.git
-    & github.com/schwallergroup/minerva.git
-    """
+    """Fit independent Gaussian processes on fixed descriptors."""
+    # Adapted from doi.org/10.1021/jacs.2c08592 and github.com/doyle-lab-ucla/edboplus.git
+    # & github.com/schwallergroup/minerva.git
     def __init__(
         self,
         train_x: torch.Tensor,

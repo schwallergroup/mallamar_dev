@@ -39,17 +39,7 @@ def plot_objective_space(
     out_path: str,
     iteration: int,
 ) -> Pathlike | None:
-    """
-    Generating pareto front plots for each seed
-
-    Args:
-        Y_cur (np.darray): Collected Y up to current iteration
-        PF: true/total pareto front Y
-        iters: Iteration at which each point in Y_cur was collected
-        obj_names: Names of objective for obj space plot
-        out_path: Output file path
-        iteration: Current BO iteration (0 = initial design, then 1..n_iters)
-    """
+    """Plot measured objectives against the full Pareto front, coloured by collection iteration."""
     m = Y_cur.shape[1]
     if m < 2 or m > 3:
         logger.info("Skipping objective space plot for %d dimensions (only 2D/3D supported).", m)
@@ -194,9 +184,7 @@ class MobboCsvLogger:
             out_path: Path,
             marker: Optional[str] = None,
         ):
-        """
-        Standardized line plot generator for metrics tracking across iterations
-        """
+        """Save a metric's progression across BO iterations."""
         plt.figure(figsize=(6, 4))
         plt.plot(df[x], df[y], marker=marker)
 
@@ -222,22 +210,7 @@ class MobboCsvLogger:
             log_wandb: bool,
             config: Dict,
         ):
-        """
-        Args:
-            current_y (torch.Tensor): Current train_y from BaseDataModule, updated at each iteration
-            Pareto_full (torch.Tensor): Ground-truth Pareto front of the full Y dataset,
-                computed once in ``train_master``. Used only for ``hv_star``, the
-                normalising constant behind ``hv_percent``.
-            sample_iters (torch.Tensor): Stored values of each collected x data point with the iteration collected
-            iteration (int): BO iteration number (0 = initial design, then 1..n_iters)
-            out_root (str): Output path file
-            model_name (str): LLM model name taken from configs
-            seed (int): Seed taken from config
-            ref_point (Tuple): Obtained from model config
-            acqf_name (str): Acquisition function class name (last dotted token of
-                ``acquisition.class_path``); shortened via ``ACQF_SHORT_NAMES``
-            config (Dict): Read config file
-        """
+        """Log observed metrics and plots against the full Pareto front for offline evaluation."""
         m = current_y.shape[1] # num_objectives
 
         if len(ref_point) != m:
@@ -264,7 +237,7 @@ class MobboCsvLogger:
         )
         _ensure_dir(out_dir)
 
-        # Converting data to numpy - we have access to current y selected + full, PF full and n_iter of BO
+        # Convert observed and reference objectives to arrays for reporting.
         Y_cur_np = _to_np(current_y)
         PF_np = _to_np(Pareto_full)
         iters_np = _to_np(sample_iters).astype(int)

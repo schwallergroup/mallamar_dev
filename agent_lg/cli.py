@@ -51,7 +51,8 @@ def main():
     parser.add_argument("--auto-approve", action="store_true", default=None,
                         help="Skip human approval gate (for dry-runs and testing)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Mock result waiting and block live mailbox commands; use a fake controller for full pipeline tests")
+                        help="Block live hardware; add --replay-data for a full campaign using recorded measurements")
+    parser.add_argument("--replay-data", default=None, help="Read-only measured BZ CSV for --dry-run; --db is a separate working pool")
     parser.add_argument("--reward-mode", choices=["off", "recompute", "freeze"], default=None,
                         help="LIVE reward calc after each batch from raw interp_*: "
                              "'recompute' refits the z-norm over ALL observed each batch; "
@@ -68,6 +69,8 @@ def main():
                     help="Maximum number of graph execution steps before raising recursion error")
 
     args = parser.parse_args()
+    if args.replay_data and not args.dry_run and not args.resume:
+        parser.error('--replay-data requires --dry-run')
     if args.status:
         if not args.thread_id:
             parser.error('--status requires --thread-id')
@@ -78,7 +81,7 @@ def main():
     if not args.resume:
         args.backend = args.backend or 'anthropic'
         args.base_url = args.base_url or 'http://localhost:11434/v1'
-        args.reward_mode = args.reward_mode or 'off'
+        args.reward_mode = args.reward_mode or ('recompute' if args.replay_data else 'off')
         args.recursion_limit = args.recursion_limit or 1000
         args.auto_approve = bool(args.auto_approve)
     if args.model is None and not args.resume:
@@ -98,8 +101,7 @@ def main():
         os.environ["OCEAN_LOCK_CONFIG"] = args.lock_config
         print(f"[lock-config] Using the fixed {args.lock_config!r} configuration.")
 
-    # Volume for the deterministic BO fallback (graph._bo_fallback) so it can run
-    # run_bo_iteration without the agent's task string. Harmless when unused.
+    # Provide the volume for BO fallback when no agent task is available.
     os.environ["OCEAN_VOLUME_UL"] = str(args.volume)
 
     if args.resume:
@@ -121,6 +123,8 @@ def main():
                 recursion_limit = args.recursion_limit,
                 campaign_mode = args.campaign_mode,
                 papers_dir = args.papers,
+                replay_data = args.replay_data,
+                dry_run = True if args.dry_run else None,
             )
         except PreflightError as e:
             print(str(e), file=sys.stderr)
@@ -145,8 +149,7 @@ def main():
         f"with per-result assessment and end with full analysis + written report."
     )
 
-    # A misconfigured axis is an operator error, not a crash — show the explanation
-    # and exit, without a traceback.
+    # Report configuration errors without a traceback.
     try:
         thread_id = run_agent(
             user_message = task,
@@ -164,6 +167,7 @@ def main():
             n_bo_iters = args.n_bo_iters,
             campaign_mode = args.campaign_mode,
             papers_dir = args.papers,
+            replay_data = args.replay_data,
         )
     except PreflightError as e:
         print(str(e), file=sys.stderr)

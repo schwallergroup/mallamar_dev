@@ -30,10 +30,10 @@ as BO selections. QC experiments are separate from these six points.
    and use the supplied authoritative HV Decision Context.
 2. **Skip this step in `bo` mode.** Otherwise, ground your hypothesis in the
    supplied LITERATURE CORPUS and OBSERVED DATA.
-   Call `update_hypothesis(hypothesis='...')` on the first iteration. Later,
-   revise it against new measurements. Carry forward supported operating windows
-   and contradicted regions with evidence. Do not resend unchanged text; skip
-   the update if the evidence changes nothing. The tool supplies `bo_iter`.
+   Call `update_hypothesis(hypothesis='...')` successfully every iteration,
+   including the prior at zero observations. Review new measurements and carry
+   forward supported windows and contradicted regions with evidence. If nothing
+   changes, explicitly save the same text. The tool supplies `bo_iter`.
 3. Call `list_available_configs`. Use `t5gemma-s` on every iteration.
 4. Call `prepare_bo_dataset()` with no arguments. The existing campaign pool
    is the dataset, so a successful no-op is expected. On error, stop this attempt.

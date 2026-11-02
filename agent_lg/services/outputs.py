@@ -20,7 +20,7 @@ class OutputPaths:
             self.directories.append(Path(mailbox) / 'mailbox')
         self.files = {config.SOURCE_ROOT / name for name in ('README.md', 'LICENSE', 'NOTICE', 'CLEANING_PROGRESS.md')}
         for key in ('OCEAN_CAMPAIGN_DB', 'OCEAN_RESULTS_DB', 'OCEAN_AUDIT_PATH',
-                    'OCEAN_HYPOTHESIS_PATH', 'MALLAMAR_ARTIFACTS_RECORD'):
+                    'OCEAN_HYPOTHESIS_PATH', 'MALLAMAR_ARTIFACTS_RECORD', 'MALLAMAR_REPLAY_DATA'):
             value = os.getenv(key)
             if value:
                 self.files.add(Path(value))

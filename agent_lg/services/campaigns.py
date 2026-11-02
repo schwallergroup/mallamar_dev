@@ -17,12 +17,12 @@ CAMPAIGN_ENVIRONMENT = (
     'OCEAN_BATCH_SIZE', 'OCEAN_N_INIT', 'OCEAN_SEED', 'OCEAN_INJECT_N_AGENT',
     'OCEAN_CONTEXT_WINDOW', 'OCEAN_BO_LLM_TIMEOUT', 'OCEAN_BO_LLM_RETRIES',
     'OCEAN_RESULT_TIMEOUT_S', 'OCEAN_RESULTS_ROOT', 'OCEAN_AUDIT_PATH', 'OCEAN_LOG_DIR',
-    'MALLAMAR_CAMPAIGN_MODE', 'MALLAMAR_REFERENCE_DATASETS', 'MALLAMAR_BO_TIMEOUT_S', 'MALLAMAR_CONFIGS_DIR',
+    'MALLAMAR_CAMPAIGN_MODE', 'MALLAMAR_REFERENCE_DATASETS', 'MALLAMAR_BO_TIMEOUT_S', 'MALLAMAR_CONFIGS_DIR', 'MALLAMAR_REPLAY_DATA',
 )
 
 PATH_SETTINGS = {
     'OCEAN_CAMPAIGN_DB', 'OCEAN_RESULTS_DB', 'OCEAN_MAILBOX_ROOT', 'OCEAN_CORPUS_DIR',
-    'OCEAN_HYPOTHESIS_PATH', 'OCEAN_RESULTS_ROOT', 'OCEAN_AUDIT_PATH', 'OCEAN_LOG_DIR', 'MALLAMAR_CONFIGS_DIR',
+    'OCEAN_HYPOTHESIS_PATH', 'OCEAN_RESULTS_ROOT', 'OCEAN_AUDIT_PATH', 'OCEAN_LOG_DIR', 'MALLAMAR_CONFIGS_DIR', 'MALLAMAR_REPLAY_DATA',
 }
 
 
@@ -54,7 +54,7 @@ class CampaignSettings:
         if not isinstance(record.get('environment'), dict):
             raise ValueError('[CampaignSettings] Invalid saved environment; original file preserved')
         keys = set(record['environment'])
-        required_environment = set(CAMPAIGN_ENVIRONMENT) - {'MALLAMAR_CONFIGS_DIR', 'MALLAMAR_CAMPAIGN_MODE'}
+        required_environment = set(CAMPAIGN_ENVIRONMENT) - {'MALLAMAR_CONFIGS_DIR', 'MALLAMAR_CAMPAIGN_MODE', 'MALLAMAR_REPLAY_DATA'}
         if not required_environment.issubset(keys) or keys - set(CAMPAIGN_ENVIRONMENT):
             raise ValueError('[CampaignSettings] Incomplete saved environment; original file preserved')
         if any(value is not None and not isinstance(value, str) for value in record['environment'].values()):
@@ -68,6 +68,8 @@ class CampaignSettings:
             raise ValueError('[CampaignSettings] base_url must be text or null; original file preserved')
         if any(not isinstance(settings[key], bool) for key in ('auto_approve', 'dry_run')):
             raise ValueError('[CampaignSettings] Approval and dry-run settings must be booleans; original file preserved')
+        if record['environment'].get('MALLAMAR_REPLAY_DATA') and not settings['dry_run']:
+            raise ValueError('[settings] Dataset replay requires dry_run')
         if settings['reward_mode'] not in ('off', 'freeze', 'recompute'):
             raise ValueError('[CampaignSettings] Unknown saved reward_mode; original file preserved')
         integer_input(settings['recursion_limit'], 'recursion_limit')

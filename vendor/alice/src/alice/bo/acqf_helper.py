@@ -1,5 +1,4 @@
-# Modified for Mallamar campaign compatibility.
-# Acquisition scores and candidate selection for multi-objective BO.
+# Modified for Mallamar campaign compatibility: acquisition scores and candidate selection.
 from collections.abc import Callable
 from typing import List
 
@@ -29,13 +28,7 @@ from botorch.utils.transforms import is_ensemble
 
 
 class qNParEGO(qNoisyExpectedImprovement, MultiObjectiveMCAcquisitionFunction):
-    """Original non-log qNParEGO using qNEI after Chebyshev scalarization.
-
-    BoTorch 0.13 exposes only the numerically improved ``qLogNParEGO`` helper.
-    This class mirrors that helper exactly through construction of the
-    composite objective, then delegates to the original non-log qNEI.  It is
-    included solely for the requested log-vs-non-log acquisition comparison.
-    """
+    """Apply non-log qNEI to a Chebyshev scalarization of multiple objectives."""
 
     def __init__(
         self,
@@ -104,39 +97,14 @@ class RandomAcqf(AcquisitionFunction):
     def __init__(self, model=None, **kwargs):
         super().__init__(model)
 
-    def forward(self, X): #! do we need this? I don't think we need to make RandomAcqf a class object
+    def forward(self, X):
         return torch.rand(X.shape[:-2], device=X.device, dtype=X.dtype)
 
 
 class MultiObjectiveUCB(AcquisitionFunction):
-    """Scalarized multi-objective Upper Confidence Bound acquisition function.
+    """Score weighted mean + beta * standard deviation using equal, random or batch-swept weights."""
 
-    For each candidate x and each objective i, computes:
-        UCB_i(x) = mu_i(x) + beta * sigma_i(x)
-
-    Then aggregates across objectives with a weighted sum:
-        score(x) = sum_i [ w_i * UCB_i(x) ]
-
-    Three weight strategies:
-        equal   — fixed uniform weights [1/n, ..., 1/n] for all candidates
-        random  — weights sampled once at construction from Uniform(simplex);
-                  re-instantiated each greedy step so each step gets fresh weights
-        diverse — class-level step counter sweeps weights linearly from [1,0] to
-                  [0,1] across the batch_size greedy steps, ensuring each step
-                  optimises a different objective trade-off
-
-    Args:
-        model:           BoTorch model (must support model.posterior(X))
-        beta:            UCB exploration parameter (default 2.0)
-        weight_strategy: "equal" | "random" | "diverse" (default "diverse")
-        num_objectives:  number of objectives (default 2)
-        batch_size:      total greedy steps; only used by "diverse" (default 24)
-        **kwargs:        absorbs X_baseline, X_pending, sampler, prune_baseline
-                         passed by BotorchOptimizer for compatibility
-    """
-
-    # Class-level counter used by "diverse" strategy to track which greedy step
-    # is currently being constructed.  Reset to 0 at the start of each batch.
+    # Reset the shared diverse-weight step counter at the start of each batch.
     _diverse_step: int = 0
 
     @classmethod
@@ -190,15 +158,7 @@ class MultiObjectiveUCB(AcquisitionFunction):
         )
 
     def forward(self, X: Tensor) -> Tensor:
-        """Score candidates.
-
-        Args:
-            X: (batch, q, d) — typically (n_candidates, 1, d) from
-               batched_acqf_forward which unsqueezes before calling.
-
-        Returns:
-            scores: (batch,) scalar score per candidate
-        """
+        """Map candidate tensors shaped (batch, 1, d) to scalar scores shaped (batch,)."""
         posterior = self.model.posterior(X)
         mean = posterior.mean        # (batch, q, num_objectives)
         std  = posterior.variance.clamp_min(1e-9).sqrt()
@@ -219,18 +179,7 @@ def select_random_candidates(
     batch_size: int,
     device: torch.device=None
 ) -> tuple[List[Tensor], List[int]]:
-    """
-    Select random candidates from design space.
-    
-    Args:
-        design_space: Full design space tensor (n_candidates, n_features)
-        batch_size: Number of random candidates to select
-        device: Device to use
-    
-    Returns:
-        candidates: List of selected candidate tensors
-        indices: List of selected indices in design_space
-    """
+    """Return random candidate tensors and their distinct design-space row indices."""
     n = design_space.shape[0]
     q = batch_size
 
@@ -271,21 +220,7 @@ def batched_acqf_forward(
     X: Tensor,
     max_eval_batch: int=2048
 ) -> Tensor:
-    """
-    Evaluates an acquisition function on a set of candidates X in memory-safe batches.
-
-    Splits a large tensor of candidate points `X` into smaller mini-batches,
-    scoring each batch sequentially, and then concatenating the results.
-
-    Args:
-        acqf: The acquisition function to evaluate. Must be a callable
-              that accepts a tensor of candidates.
-        X: A tensor of candidate points to be scored.
-        max_eval_batch: The number of candidates to evaluate in each batch.
-
-    Returns:
-        A tensor containing the acquisition score for each candidate in `X`
-    """
+    """Score candidate rows in bounded batches and concatenate their acquisition scores."""
     scores = []
     n_total = X.shape[0]
     n_batches = (n_total + max_eval_batch - 1) // max_eval_batch

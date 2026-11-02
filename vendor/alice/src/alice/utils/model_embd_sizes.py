@@ -1,5 +1,4 @@
-# Modified for Mallamar campaign compatibility.
-# Native embedding widths used when building projection heads.
+# Modified for Mallamar campaign compatibility: native embedding widths for projection heads.
 MODEL_EMBEDDING_SIZES = {
     't5-base': 768,
     't5-small': 512,

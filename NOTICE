@@ -21,7 +21,7 @@ limitations under the License.
 ALICE
 Copyright 2024-2026 Laboratory of Artificial Chemical Intelligence, EPFL, Switzerland
 Apache License, Version 2.0.
-Original notice retained in vendor/alice/LICENSE.
+Original notice retained in vendor/alice/LICENSE-ALICE.
 
 The copied ALICE packaging, installation documentation, and model loading/encoder forwarding, acquisition functions, initialization and embedder freezing have been modified
 for Mallamar's shared environment and historical Gollum campaign compatibility. Its original environment specifications
